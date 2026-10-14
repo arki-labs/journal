@@ -11,7 +11,7 @@ import { createCommandRunner } from './command.js';
 import { defineEntity } from './entity.js';
 import { JournalError } from './errors.js';
 import { defineEvent } from './event.js';
-import { bindEffect, bindTap, defineProjection, effectFor, tapFor } from './handlers.js';
+import { bindEffect, bindHandlers, bindTap, defineProjection, effectFor, tapFor } from './handlers.js';
 import { createHistory } from './history.js';
 import { createHookPoint } from './hooks.js';
 import { createAdmin, createCatchUp, createDrain, createStrandedJobs, createTapDispatch, createWorkers, } from './worker.js';
@@ -61,13 +61,17 @@ function createInit(metaSchema) {
     return {
         event: defineEvent,
         entity,
-        command: (name, input, handler) => ({ name, input, handler }),
+        command: (name, input, handler, options) => options?.authorize === undefined
+            ? { name, input, handler }
+            : { name, input, handler, authorize: options.authorize },
         projection: (name, entity, on, opts) => defineProjection(name, entity, on, opts),
         effect: effectFor(),
         tap: tapFor(),
         compose: config => {
-            const effects = (config.effects ?? []).map(effect => bindEffect(effect, config.services ?? {}));
-            const taps = (config.taps ?? []).map(tap => bindTap(tap, config.services ?? {}));
+            // `'worker'`: the handlers keep their needs, and each worker or drain gives the services.
+            const services = config.services === 'worker' ? undefined : (config.services ?? {});
+            const effects = (config.effects ?? []).map(effect => services === undefined ? effect : bindEffect(effect, services));
+            const taps = (config.taps ?? []).map(tap => (services === undefined ? tap : bindTap(tap, services)));
             return createJournal(metaSchema, config.tables, config.projections ?? [], effects, taps);
         },
     };
@@ -81,7 +85,9 @@ function assertUniqueNames(kind, handlers) {
         seen.add(name);
     }
 }
-function createJournal(metaSchema, tables, projections, effects, taps = []) {
+function createJournal(metaSchema, tables, projections, 
+/** An effect or a tap may still have needs (`services: 'worker'`): only the worker runs them, with its `services`. */
+effects, taps = []) {
     assertUniqueNames('tap', taps);
     const eventsSchema = getTableConfig(tables.events).schema;
     const wakeChannel = eventsSchema === undefined ? 'journal_wake' : `${eventsSchema}_journal_wake`;
@@ -128,6 +134,7 @@ function createJournal(metaSchema, tables, projections, effects, taps = []) {
         drain: (db, opts) => journal.drain(db, opts),
         catchUp: (db, opts) => journal.catchUp(db, opts),
         dispatch,
+        checkServices: services => void bindHandlers({ effects, taps }, services),
         tapNames: taps.map(tap => tap.name),
     });
     const strandedJobs = createStrandedJobs({ tables, effectNames: effects.map(effect => effect.name) });

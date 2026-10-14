@@ -303,6 +303,18 @@ export type Needed<N extends Needs> = {
 };
 /** Real services by name, as an app or a Dot feature hands them over. */
 export type Services = Readonly<Record<string, unknown>>;
+/** Names one effect or one tap. Effect names and tap names are two separate sets. */
+export type HandlerRef = {
+    readonly kind: 'effect' | 'tap';
+    readonly name: string;
+};
+/**
+ * The services of each effect and tap, given where they run instead of where the journal
+ * is composed: `j.compose({ ..., services: 'worker' })`, then `journal.worker(db, { services })`.
+ * One function, so each handler can get its own services: two Dot features may use one need
+ * name for two different services.
+ */
+export type HandlerServices = (handler: HandlerRef) => Services;
 type UnionToIntersection<U> = (U extends unknown ? (member: U) => void : never) extends (all: infer I) => void ? I : never;
 /** The needs of each effect in a union. An effect that needs nothing adds nothing. */
 type DeclaredNeeds<E> = E extends {

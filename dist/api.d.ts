@@ -7,7 +7,7 @@ import type { z } from 'zod';
 import type { EntityBuilder } from './entity.js';
 import type { HookPoint } from './hooks.js';
 import type { JournalTables } from './pg.js';
-import type { AnyEntity, AnyEventDef, CommandHookContext, DbHandle, Effect, EffectHandlers, EffectHookContext, EntityDef, EntityId, EntityInfo, EntityTable, EventDef, EventOptions, IdTable, JournalWorker, KeyName, Needs, PendingOf, Projection, ProjectionHandlers, ProjectionOptions, RecordedOf, ReducerRow, RootDb, Row, Services, ServicesFor, SingleKey, StrandedJobs, Tap, TapHandlers, TransactionSource, WakeListener } from './types.js';
+import type { AnyEntity, AnyEventDef, CommandHookContext, DbHandle, Effect, EffectHandlers, EffectHookContext, EntityDef, EntityId, EntityInfo, EntityTable, EventDef, EventOptions, HandlerServices, IdTable, JournalWorker, KeyName, Needs, PendingOf, Projection, ProjectionHandlers, ProjectionOptions, RecordedOf, ReducerRow, RootDb, Row, Services, ServicesFor, SingleKey, StrandedJobs, Tap, TapHandlers, TransactionSource, WakeListener } from './types.js';
 /**
  * Looks at the locked row, checks the rules, and returns the events to append.
  * Runs after the row is locked, inside the write's savepoint. `tx` is that
@@ -38,6 +38,27 @@ export type Command<S extends z.ZodType, R, in MetaOut, in Tx extends Transactio
     readonly name: string;
     readonly input: S;
     readonly handler: (input: z.output<S>, context: CommandContext<MetaOut, Tx>) => R;
+    /** The command's `authorize` option, when it has one. See {@link CommandOptions}. */
+    readonly authorize?: CommandAuthorize<z.output<S>, MetaOut, Tx>;
+};
+/**
+ * Decides whether the caller may run a command. It runs inside the command's transaction,
+ * after the input and `meta` are parsed, on every call: a call that replays an idempotency
+ * receipt runs it too, before the stored result is returned. Throw (a `CommandError`
+ * `FORBIDDEN`, usually) to refuse; the run rolls back and nothing is replayed.
+ */
+export type CommandAuthorize<Input, in MetaOut, in Tx extends TransactionSource<Tx> = DbHandle> = (input: Input, context: {
+    readonly tx: Tx;
+    readonly meta: MetaOut;
+}) => void | Promise<void>;
+/** Options of `j.command`. */
+export type CommandOptions<Input, MetaOut, Tx extends TransactionSource<Tx> = DbHandle> = {
+    /**
+     * Put the caller's permission check here, not in the handler. A repeat with an idempotency
+     * key does not run the handler, so a check inside it would not run either: the stored result
+     * would go to whoever replays the key. `authorize` runs on the first call and on every replay.
+     */
+    readonly authorize?: CommandAuthorize<Input, MetaOut, Tx>;
 };
 /**
  * What a command handler receives. `write` and `run` are bound to the command's
@@ -207,11 +228,13 @@ export type Journal<Meta extends z.ZodObject, Tx extends TransactionSource<Tx> =
      * covers only its own work, and the lease is renewed every half lease while the effect
      * runs. A lost lease aborts the effect's `ctx.signal`.
      * Once `signal` is aborted no further job is claimed; the running one sees it as `ctx.signal`.
+     * `services`: see `worker`.
      */
     drain(db: AppDb & RootDb & TransactionSource<Tx>, opts?: {
         readonly batchSize?: number;
         readonly signal?: AbortSignal;
         readonly leaseSeconds?: number;
+        readonly services?: HandlerServices;
     }): Promise<number>;
     /**
      * A loop around `drain`. The same database as `drain`. `stop()` aborts the running
@@ -229,6 +252,12 @@ export type Journal<Meta extends z.ZodObject, Tx extends TransactionSource<Tx> =
         readonly listen?: WakeListener;
         /** `false`: a jobs-only worker in a journal that has taps. Another process must listen. */
         readonly taps?: boolean;
+        /**
+         * The services of a journal composed with `services: 'worker'`, per effect and tap.
+         * A need without a value throws here, before the worker starts. A journal composed
+         * with its services ignores this.
+         */
+        readonly services?: HandlerServices;
     }): JournalWorker;
     /**
      * The Postgres channel every commit that recorded events notifies, with the seq range as
@@ -302,7 +331,7 @@ export type JournalDefinitions<Meta extends z.ZodObject, Tx extends TransactionS
      * `write` and `run` are bound to one transaction and one parsed `meta`.
      * Needs only `j`, entities and events, never the finished journal.
      */
-    command<S extends z.ZodType, R>(name: string, input: S, handler: (input: z.output<S>, context: CommandContext<z.output<Meta>, Tx>) => R): Command<S, R, z.output<Meta>, Tx>;
+    command<S extends z.ZodType, R>(name: string, input: S, handler: (input: z.output<S>, context: CommandContext<z.output<Meta>, Tx>) => R, options?: CommandOptions<z.output<S>, z.output<Meta>, Tx>): Command<S, R, z.output<Meta>, Tx>;
     /** `on` is `NoInfer` so `E` comes from `entity`; handlers are then contextually typed. */
     projection<E extends AnyEntity<z.output<Meta>>>(name: string, entity: E | readonly E[], on: NoInfer<ProjectionHandlers<E, z.output<Meta>, Tx>>, opts?: ProjectionOptions): Projection<z.output<Meta>, Tx>;
     effect<E extends AnyEntity<z.output<Meta>>>(name: string, entity: E | readonly E[], on: NoInfer<EffectHandlers<E, z.output<Meta>, AppDb, RootCommandRunner<Meta, Tx>>>): Effect<z.output<Meta>, AppDb, RootCommandRunner<Meta, Tx>>;
@@ -313,7 +342,7 @@ export type JournalDefinitions<Meta extends z.ZodObject, Tx extends TransactionS
     effect<E extends AnyEntity<z.output<Meta>>, N extends Needs>(name: string, entity: E | readonly E[], needs: N, on: NoInfer<EffectHandlers<E, z.output<Meta>, AppDb, RootCommandRunner<Meta, Tx>, N>>): Effect<z.output<Meta>, AppDb, RootCommandRunner<Meta, Tx>, N>;
     /**
      * Build the runtime journal from the tables and the handlers. `services` holds one
-     * value for every need of every listed effect, by name. A need without a value throws here.
+     * value for every need of every listed effect, by name. A need without a value throws here, unless `services` is `'worker'`.
      * `const`: the list is read as a tuple, so an effect with needs keeps them next to one without.
      */
     /** A tap: in-process, after commit, lossy. See `Tap`. Same shapes as `effect`. */
@@ -326,11 +355,16 @@ export type JournalDefinitions<Meta extends z.ZodObject, Tx extends TransactionS
         readonly taps?: T;
     } & ServicesOption<ServicesFor<E> & ServicesFor<T>>): Journal<Meta, Tx, AppDb>;
 };
-/** `services` is required as soon as one listed effect has a need. */
+/**
+ * `services` is required as soon as one listed effect has a need. `'worker'` leaves the needs
+ * open: writes never need them, and each `worker` or `drain` gives them (`HandlerServices`).
+ * That is for services that exist only after the journal: the Dot adapter's features boot
+ * after the journal they write through.
+ */
 type ServicesOption<S> = unknown extends S ? {
-    readonly services?: Services;
+    readonly services?: Services | 'worker';
 } : {
-    readonly services: S & Services;
+    readonly services: (S & Services) | 'worker';
 };
 export {};
 //# sourceMappingURL=api.d.ts.map

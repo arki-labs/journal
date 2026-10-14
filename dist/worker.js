@@ -2,6 +2,7 @@ import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lte, max, notI
 import { debugDrain, debugWorker } from './debug.js';
 import { JournalError } from './errors.js';
 import { findEventDefinition } from './fold.js';
+import { bindHandlers } from './handlers.js';
 import { leaseToken } from './id.js';
 import { assertRootDb } from './storage.js';
 const DEFAULT_LEASE_SECONDS = 60;
@@ -23,8 +24,7 @@ const dbNowPlus = (seconds) => sql `now() + make_interval(secs => ${seconds})`;
 export function createDrain(deps) {
     const { events: eventsTable, jobs: jobsTable } = deps.tables;
     const { decodeStoredEvent } = deps.history;
-    const effectsByName = new Map(deps.effects.map(effect => [effect.name, effect]));
-    const known = [...effectsByName.keys()];
+    const known = deps.effects.map(effect => effect.name);
     // Every time here is database time, so a worker with a skewed clock
     // cannot take a live lease or push a retry into the far future.
     const claimOne = (db, leaseSeconds) => db.transaction(async (tx) => {
@@ -94,7 +94,7 @@ export function createDrain(deps) {
             clearInterval(timer);
         };
     };
-    const runJob = async (db, job, signal, leaseSeconds) => {
+    const runJob = async (db, job, signal, leaseSeconds, effectsByName) => {
         const effect = effectsByName.get(job.effect);
         const lost = new AbortController();
         const stopRenewing = renewWhile(db, job, leaseSeconds, lost);
@@ -136,6 +136,9 @@ export function createDrain(deps) {
     };
     return async (db, opts) => {
         assertRootDb(db, 'drain');
+        // Before any claim: a missing service refuses the drain, not one job after another.
+        const { effects } = bindHandlers({ effects: deps.effects, taps: [] }, opts?.services);
+        const effectsByName = new Map(effects.map(effect => [effect.name, effect]));
         deps.hooks.freeze();
         const batchSize = opts?.batchSize ?? 20;
         const leaseSeconds = opts?.leaseSeconds ?? DEFAULT_LEASE_SECONDS;
@@ -153,7 +156,7 @@ export function createDrain(deps) {
             if (job === undefined)
                 break;
             claimed += 1;
-            await runJob(db, job, signal, leaseSeconds);
+            await runJob(db, job, signal, leaseSeconds, effectsByName);
         }
         return claimed;
     };
@@ -317,19 +320,20 @@ export function createTapDispatch(deps) {
     const kinds = [...new Set(deps.taps.flatMap(tap => tap.entities.map(entity => entity.kind)))];
     const types = [...new Set(deps.taps.flatMap(tap => [...tap.types]))];
     /** Load the committed events in the range that some tap wants, and run each matching tap. Errors are logged, never thrown. */
-    const dispatch = async (db, payload) => {
+    const dispatch = async (db, payload, services) => {
         if (deps.taps.length === 0)
             return;
         const range = parseRange(payload);
         if (range === undefined)
             return;
+        const { taps } = bindHandlers({ effects: [], taps: deps.taps }, services);
         const rows = await db
             .select()
             .from(eventsTable)
             .where(and(gte(eventsTable.seq, range.from), lte(eventsTable.seq, range.to), inArray(eventsTable.kind, kinds), inArray(eventsTable.type, types)))
             .orderBy(asc(eventsTable.seq));
         for (const row of rows) {
-            for (const tap of deps.taps) {
+            for (const tap of taps) {
                 if (!tap.types.has(row.type) || !tap.entities.some(entity => entity.kind === row.kind))
                     continue;
                 try {
@@ -357,6 +361,7 @@ export function createWorkers(deps) {
     const wakers = new Set();
     const worker = (db, opts) => {
         assertRootDb(db, 'worker');
+        deps.checkServices(opts?.services);
         if (deps.tapNames.length > 0 && opts?.listen === undefined && opts?.taps !== false)
             throw new Error(`journal: this journal has taps (${deps.tapNames.join(', ')}) but the worker has no \`listen\`; taps fire only from the wake channel. Wire LISTEN on journal.wakeChannel, or pass { taps: false } for a worker that runs jobs only`);
         const pollMs = opts?.pollMs ?? DEFAULT_POLL_MS;
@@ -395,6 +400,7 @@ export function createWorkers(deps) {
                         batchSize: opts?.batchSize,
                         signal: stopping.signal,
                         leaseSeconds: opts?.leaseSeconds,
+                        services: opts?.services,
                     });
                     if (isRunning()) {
                         const caught = await deps.catchUp(db);
@@ -426,7 +432,7 @@ export function createWorkers(deps) {
                         wake();
                         if (opts.taps === false)
                             return;
-                        dispatching = dispatching.then(() => deps.dispatch(db, payload)).catch(quiet);
+                        dispatching = dispatching.then(() => deps.dispatch(db, payload, opts.services)).catch(quiet);
                     });
                 }
                 debugWorker.debug('start (poll {pollMs}ms{value2})', {

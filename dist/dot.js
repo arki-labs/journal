@@ -1,9 +1,10 @@
+import { driven, driver, sliceOf } from '@arki/dot/feature';
 import { DotPluginError, plugin, service } from '@arki/dot/plugin';
 import { debugWorker } from './debug.js';
 import { JournalError } from './errors.js';
-import { bindEffect, bindTap } from './handlers.js';
+import { givenServices } from './handlers.js';
 export const JOURNAL_ACTION_META_SCHEMA = '@arki/journal/action-meta@1';
-export const JOURNAL_PLUGIN_ERROR_CODES = { badSlice: 'JOURNAL_PLUGIN_E001' };
+export const JOURNAL_PLUGIN_ERROR_CODES = { badSlice: 'ARKI_JOURNAL_PLUGIN_E001' };
 function effectAction(effect) {
     return {
         id: `${effect.name}.run`,
@@ -15,14 +16,14 @@ function effectAction(effect) {
     };
 }
 /**
- * Declare a feature's projections and effects as a boot-time slice
- * (`defineFeature(..., { use: [journalHandlers({ projections, effects })] })`).
- * The payload lands under `journal` in the feature's slice token, where
- * `journal({ j, tables, features })` collects it.
+ * Declare a feature's projections, effects and taps
+ * (`feature('orders', { use: [journalHandlers({ projections, effects })] })`).
+ * `journal({ j, tables })` reads them from the feature value and composes the journal.
  *
  * An effect with needs (`j.effect(name, entity, { mailer: need<Mailer>() }, on)`) gets
- * them from the booted services of this feature, by name. The feature must declare
- * each one in its own `needs`: the slice's `resolve` does not type-check otherwise.
+ * them from the booted services of this feature, by name, when `journalWorker()` runs it.
+ * The feature must declare each one in its own `needs`: the slice's `resolve` does not
+ * type-check otherwise, and throws at the feature's boot when the types were bypassed.
  * Two features may use the same need name for two different services.
  *
  * Actions: one per effect. Projections add none: they run inside the write, not
@@ -33,12 +34,17 @@ export function journalHandlers(handlers) {
     return {
         key: 'journal',
         actions: effects.map(effect => effectAction(effect)),
+        handlers: { projections, effects, taps },
         // The kernel hands the feature's services over untyped, so they are read by name here.
-        resolve: (services) => ({
-            projections,
-            effects: effects.map(effect => bindEffect(effect, isServices(services) ? services : {})),
-            taps: taps.map(tap => bindTap(tap, isServices(services) ? services : {})),
-        }),
+        resolve: (services) => {
+            const given = isServices(services) ? services : {};
+            // Checked at the feature's boot, so a missing service never waits for the first job.
+            for (const effect of effects)
+                givenServices('effect', effect, given);
+            for (const tap of taps)
+                givenServices('tap', tap, given);
+            return { services: given };
+        },
     };
 }
 const isServices = (value) => typeof value === 'object' && value !== null;
@@ -48,80 +54,74 @@ const isHandler = (value) => typeof value === 'object' &&
     typeof value.name === 'string' &&
     'run' in value &&
     typeof value.run === 'function';
-/** The kernel hands services over untyped, so the slice shape is checked here, once, at boot. */
-function isJournalHandlers(value) {
+const isHandlerList = (value) => Array.isArray(value) && value.every(item => isHandler(item));
+/** A slice's static `handlers` are read untyped from the feature, so their shape is checked here. */
+function isJournalDeclarations(value) {
     return (typeof value === 'object' &&
         value !== null &&
         'projections' in value &&
-        Array.isArray(value.projections) &&
-        value.projections.every(item => isHandler(item)) &&
+        isHandlerList(value.projections) &&
         'effects' in value &&
-        Array.isArray(value.effects) &&
-        value.effects.every(item => isHandler(item)) &&
+        isHandlerList(value.effects) &&
         'taps' in value &&
-        Array.isArray(value.taps) &&
-        value.taps.every(item => isHandler(item)));
+        isHandlerList(value.taps));
+}
+function badSlice(feature, what) {
+    return new DotPluginError({
+        code: JOURNAL_PLUGIN_ERROR_CODES.badSlice,
+        message: `[journal] feature "${feature.name}" has a \`journal\` slice whose ${what}.`,
+        remediation: 'Declare the slice with journalHandlers({ projections, effects, taps }) from @arki/journal/dot.',
+        docsUrl: 'https://github.com/arki-labs/arki/blob/HEAD/packages/journal/docs/agent-guide.md#dot-boot-errors',
+    });
 }
 /**
  * Throws when another handler of this kind already has the name, and names the
- * feature tokens that hold the two. `j.compose` makes the same check, but it gets
+ * features that hold the two. `j.compose` makes the same check, but it gets
  * one flat list and cannot say which feature a handler came from.
  */
 function claimName(kind, owners, name, feature) {
-    const owner = owners.get(name);
+    const owner = owners.get(`${kind}:${name}`);
     if (owner !== undefined) {
-        const where = owner === feature ? `feature "${feature}", twice` : `features "${owner}" and "${feature}"`;
+        const where = owner === feature ? `feature "${feature.name}", twice` : `features "${owner.name}" and "${feature.name}"`;
         throw new JournalError('BAD_DEFINITION', kind, name, `journal: duplicate ${kind} name "${name}" (${where})`);
     }
-    owners.set(name, feature);
+    owners.set(`${kind}:${name}`, feature);
 }
 /**
- * Read each feature's `journal` slice from the booted services, in feature order.
- * Refuses a projection name or an effect name that is listed twice.
+ * Read each feature's `journal` slice declarations, in feature order. Refuses a name
+ * that is listed twice. `owners` maps `effect:<name>` and `tap:<name>` (and
+ * `projection:<name>`) to the feature that lists it.
  */
-function collectHandlers(features, services) {
+function readDeclarations(features) {
     const projections = [];
     const effects = [];
     const taps = [];
-    const projectionOwners = new Map();
-    const effectOwners = new Map();
-    const tapOwners = new Map();
+    const owners = new Map();
     for (const feature of features) {
-        const slices = services[feature.key];
-        const slice = typeof slices === 'object' && slices !== null && 'journal' in slices ? slices.journal : undefined;
+        const slice = feature.use.find(item => item.key === 'journal');
         if (slice === undefined) {
-            debugWorker.debug('[journal] feature "{featureKey}" did not contribute a journal slice', {
-                featureKey: feature.key,
+            debugWorker.debug('[journal] feature "{featureName}" did not contribute a journal slice', {
+                featureName: feature.name,
             });
             continue;
         }
-        if (!isJournalHandlers(slice)) {
-            throw new DotPluginError({
-                code: JOURNAL_PLUGIN_ERROR_CODES.badSlice,
-                message: `[journal] feature token "${feature.key}" holds a \`journal\` slice that is not lists of projections, effects and taps.`,
-                remediation: 'Declare the slice with journalHandlers({ projections, effects, taps }) from @arki/journal/dot.',
-                docsUrl: 'https://github.com/arki-labs/arki/blob/HEAD/packages/journal/docs/agent-guide.md#dot-boot-errors',
-            });
-        }
-        for (const { name } of slice.projections)
-            claimName('projection', projectionOwners, name, feature.key);
-        for (const { name } of slice.effects)
-            claimName('effect', effectOwners, name, feature.key);
-        for (const { name } of slice.taps)
-            claimName('tap', tapOwners, name, feature.key);
-        projections.push(...slice.projections);
-        effects.push(...slice.effects);
-        taps.push(...slice.taps);
+        const declared = 'handlers' in slice ? slice.handlers : undefined;
+        if (!isJournalDeclarations(declared))
+            throw badSlice(feature, 'handlers are not lists of projections, effects and taps');
+        for (const { name } of declared.projections)
+            claimName('projection', owners, name, feature);
+        for (const { name } of declared.effects)
+            claimName('effect', owners, name, feature);
+        for (const { name } of declared.taps)
+            claimName('tap', owners, name, feature);
+        projections.push(...declared.projections);
+        effects.push(...declared.effects);
+        taps.push(...declared.taps);
     }
-    return { projections, effects, taps };
+    return { declarations: { projections, effects, taps }, owners };
 }
-export function journal(options) {
-    let composed;
-    let worker;
-    // Each feature token is a need, so the kernel boots the features first and refuses a missing one.
-    const featureNeeds = 'features' in options ? options.features.map(feature => [feature.key, feature]) : [];
+function journalPlugin(build) {
     const needs = {
-        ...Object.fromEntries(featureNeeds),
         db: service(),
     };
     return plugin({
@@ -131,29 +131,58 @@ export function journal(options) {
             ctx.registerService('journal', 'custom');
             ctx.declareProvides('journal');
         },
-        boot(services) {
-            composed =
-                'journal' in options
-                    ? options.journal
-                    : options.j.compose({ tables: options.tables, ...collectHandlers(options.features, services) });
-            return { journal: composed };
-        },
-        async start({ db }) {
-            if (options.worker === false)
-                return;
-            worker = composed?.worker(db, {
-                pollMs: options.pollMs,
-                batchSize: options.batchSize,
-                leaseSeconds: options.leaseSeconds,
-                listen: options.listen,
-                taps: options.taps,
-            });
-            await worker?.start();
-        },
-        async stop() {
-            await worker?.stop();
-            worker = undefined;
-        },
+        boot: () => ({ journal: build() }),
+    });
+}
+export function journal(options) {
+    if ('journal' in options) {
+        const composed = options.journal;
+        return journalPlugin(() => composed);
+    }
+    const { j, tables } = options;
+    return driven(features => journalPlugin(() => 
+    // `'worker'`: the effects' services exist only once the features boot, after this journal.
+    j.compose({ tables, ...readDeclarations(features).declarations, services: 'worker' })));
+}
+/** The services a feature's `journal` slice published at its boot. */
+function sliceServices(ctx, feature) {
+    const payload = sliceOf(ctx, feature).journal;
+    if (typeof payload !== 'object' || payload === null || !('services' in payload) || !isServices(payload.services))
+        throw badSlice(feature, 'boot payload holds no services; it was not made by journalHandlers');
+    return payload.services;
+}
+/**
+ * The driving part, for `.serve()`: one worker between `start` and `stop`, for the
+ * journal that `journal(...)` published. Each effect and tap of a feature gets the
+ * services of that feature. A process that serves no worker still writes: its jobs
+ * wait for a process that does.
+ */
+export function journalWorker(options = {}) {
+    return driver(features => {
+        let worker;
+        return plugin({
+            name: 'journal-worker',
+            needs: { db: service(), journal: service() },
+            boot(ctx) {
+                const { owners } = readDeclarations(features);
+                const byFeature = new Map();
+                // Every owner listed a `journal` slice, so each has a slice record.
+                for (const feature of new Set(owners.values()))
+                    byFeature.set(feature, sliceServices(ctx, feature));
+                const services = ({ kind, name }) => {
+                    const owner = owners.get(`${kind}:${name}`);
+                    return (owner === undefined ? undefined : byFeature.get(owner)) ?? {};
+                };
+                // Built at boot, not at start: a missing service fails the boot.
+                worker = ctx.journal.worker(ctx.db, { ...options, services });
+            },
+            async start() {
+                await worker?.start();
+            },
+            async stop() {
+                await worker?.stop();
+            },
+        });
     });
 }
 //# sourceMappingURL=dot.js.map

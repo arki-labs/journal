@@ -1,6 +1,6 @@
 # @arki/journal
 
-Published version: **0.1.1**
+Published version: **0.2.1**
 
 This repository is a **read-only mirror** of the [@arki/journal](https://www.npmjs.com/package/@arki/journal) npm package.
 

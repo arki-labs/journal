@@ -47,7 +47,7 @@ function dueAt(effect, event) {
 }
 /** Insert order is the version order. `RETURNING` does not promise it, so restore it. */
 export function sortedByVersion(rows) {
-    return rows.toSorted((a, b) => a.version - b.version);
+    return [...rows].sort((a, b) => a.version - b.version);
 }
 export function createWriter(deps) {
     const { metaSchema, projections, asyncProjections, effects } = deps;
