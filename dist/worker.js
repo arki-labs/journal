@@ -438,7 +438,6 @@ export function createWorkers(deps) {
             async stop() {
                 running = false;
                 stopping.abort();
-                // eslint-disable-next-line drizzle/enforce-delete-with-where -- Set#delete, not a Drizzle query
                 wakers.delete(wake);
                 endSleep?.();
                 await unlisten?.();

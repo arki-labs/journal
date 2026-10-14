@@ -31,7 +31,6 @@ export function oneAtATime(handle, what, work) {
             throw new Error(`journal: ${what} started on a transaction that already has a journal operation in flight; await operations on one transaction one at a time`);
         });
     }
-    // eslint-disable-next-line drizzle/enforce-delete-with-where -- WeakMap#delete, not a Drizzle query
     const running = work().finally(() => inFlight.delete(handle));
     inFlight.set(handle, running);
     return running;
