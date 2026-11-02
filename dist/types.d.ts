@@ -1,6 +1,12 @@
 import type { AnyRelations } from 'drizzle-orm';
 import type { AnyPgColumn, PgAsyncDatabase, PgQueryResultHKT, PgTableWithColumns } from 'drizzle-orm/pg-core';
-import type { z } from 'zod';
+import type { Failure, SchemaFailure } from '@arki/failure';
+import type { Backoff } from '@arki/resilience';
+import type { SchemaInput, SchemaOutput, StandardSchemaV1 } from '@arki/schema';
+import type { EventLog } from './event-log.js';
+import type { JobKind } from './pg.js';
+import type { EffectRetention } from './retention.js';
+import type { StepPhase } from './workflow/states.js';
 /**
  * A function type whose parameters are checked bivariantly.
  *
@@ -144,9 +150,9 @@ export type Recorded<T extends string = string, Data = unknown, Meta = unknown, 
  * An event definition. Calling it validates the data and returns a pending
  * event. `type` and `schema` are read by the entity builder and by replay.
  */
-export type EventDef<T extends string, S extends z.ZodType> = BivariantFn<[
-    data: z.input<S>
-], Pending<T, z.output<S>>> & {
+export type EventDef<T extends string, S extends StandardSchemaV1> = BivariantFn<[
+    data: SchemaInput<S>
+], Pending<T, SchemaOutput<S>> | SchemaFailure> & {
     readonly type: T;
     readonly schema: S;
     /**
@@ -154,7 +160,7 @@ export type EventDef<T extends string, S extends z.ZodType> = BivariantFn<[
      * removed. It must still fit `schema`. Absent on an event that holds no personal data.
      * A method signature, so every `EventDef` is an `AnyEventDef`; see `BivariantFn`.
      */
-    erased?(data: z.output<S>): z.input<S>;
+    erased?(data: SchemaOutput<S>): SchemaInput<S>;
     /**
      * The schema version new events are stored at: one more than the number of upcasters.
      * Rows record it in `schema_version`; a row at an older version is upcast on read.
@@ -169,20 +175,20 @@ export type EventDef<T extends string, S extends z.ZodType> = BivariantFn<[
  * `up` is a method signature, so a typed step is an `Upcaster`; see `BivariantFn`.
  */
 export type Upcaster = {
-    readonly from: z.ZodType;
+    readonly from: StandardSchemaV1;
     up(data: unknown): unknown;
 };
 /** Typed upcaster steps: each `up` receives the output of its own `from`. */
-export type UpcasterSteps<U extends readonly z.ZodType[]> = {
+export type UpcasterSteps<U extends readonly StandardSchemaV1[]> = {
     readonly [K in keyof U]: {
         readonly from: U[K];
-        readonly up: (data: z.output<U[K]>) => unknown;
+        readonly up: (data: SchemaOutput<U[K]>) => unknown;
     };
 };
 /** The third argument of `j.event`. */
-export type EventOptions<S extends z.ZodType, U extends readonly z.ZodType[] = readonly []> = {
+export type EventOptions<S extends StandardSchemaV1, U extends readonly StandardSchemaV1[] = readonly []> = {
     /** See `EventDef.erased`. */
-    readonly erased?: (data: z.output<S>) => z.input<S>;
+    readonly erased?: (data: SchemaOutput<S>) => SchemaInput<S>;
     /**
      * Older shapes of this event, oldest first: `{ from: schemaV1, up: v1 => v2 }`, then
      * `{ from: schemaV2, up: v2 => v3 }`. The last step's result must fit the current schema.
@@ -190,9 +196,9 @@ export type EventOptions<S extends z.ZodType, U extends readonly z.ZodType[] = r
      */
     readonly upcasters?: UpcasterSteps<U>;
 };
-export type AnyEventDef = EventDef<string, z.ZodType>;
+export type AnyEventDef = EventDef<string, StandardSchemaV1>;
 /** The pending form of one or more event definitions. Distributes over unions. */
-export type PendingOf<D> = D extends AnyEventDef ? Pending<D['type'], z.output<D['schema']>> : never;
+export type PendingOf<D> = D extends AnyEventDef ? Pending<D['type'], SchemaOutput<D['schema']>> : never;
 /** The recorded form of one or more event definitions. */
 export type RecordedOf<D, Meta, Id extends string = string> = PendingOf<D> & RecordedStamp<Meta, Id>;
 /**
@@ -219,6 +225,15 @@ export type Reducers<Tbl extends EntityTable, Meta, Key extends string = 'id'> =
     readonly create?: CreateReducer<Tbl, Meta, Key>;
     readonly on?: OnReducer<Tbl, Meta, Key>;
 };
+/**
+ * Whether and where an entity's events are kept. `'stored'`: every write appends its events to
+ * `journal_events`, and replay, verify, repair, forget, rerun, async projections and taps
+ * work. `'transient'`: the events exist only inside the write (inline projections, the
+ * write's result) and in the effect jobs they queue; nothing reads them back later.
+ * An `EventLog`: the events go to that log. One that joins the transaction is written with
+ * the row; one that cannot is forwarded: a `forward` job appends them after the commit.
+ */
+export type EventStorage = 'stored' | 'transient' | EventLog;
 /** An entity: a kind, its table and key column, and the events and reducers declared so far. */
 export type EntityDef<K extends string, Tbl extends EntityTable, E extends AnyEventDef, Meta, Key extends string = 'id'> = {
     readonly kind: K;
@@ -231,6 +246,8 @@ export type EntityDef<K extends string, Tbl extends EntityTable, E extends AnyEv
     readonly uuidKey: boolean;
     /** The longest id the key holds, in code points, decided once when the entity is defined. */
     readonly keyLimit: KeyLimit;
+    /** Resolved once when the entity is defined: the entity's own setting, else the journal's default. */
+    readonly eventStorage: EventStorage;
     readonly events: ReadonlyMap<string, AnyEventDef>;
     readonly reducers: ReadonlyMap<string, Reducers<Tbl, Meta, Key>>;
     /** Phantom: the union of event definitions this entity accepts. Never set at runtime. */
@@ -250,11 +267,14 @@ export type EntityIdOf<E> = E extends {
 export type ProjectionHandlers<E, Meta, Tx = DbHandle> = {
     readonly [D in EventsOf<E> as D['type']]?: BivariantFn<[tx: Tx, event: RecordedOf<D, Meta, EntityIdOf<E>>], unknown>;
 };
-/** An effect handler also gets one value for each of the effect's needs `N`, under the need's name. */
-export type EffectHandlers<E, Meta, AppDb = RootDb, Run = unknown, N extends Needs = NoNeeds> = {
+/**
+ * An effect handler also gets one value for each of the effect's needs `N`, under the need's name. `Context` is what
+ * else it sees: `EffectContext` for every effect an app writes.
+ */
+export type EffectHandlers<E, Meta, AppDb = RootDb, N extends Needs = NoNeeds, Context extends EffectContext<AppDb> = EffectContext<AppDb>> = {
     readonly [D in EventsOf<E> as D['type']]?: BivariantFn<[
         event: RecordedOf<D, Meta, EntityIdOf<E>>,
-        ctx: EffectContext<AppDb, Run> & Needed<N>
+        ctx: Context & Needed<N>
     ], unknown>;
 };
 /** Inline handler. Runs inside the write's transaction. */
@@ -275,15 +295,25 @@ export type ProjectionOptions = {
     readonly lane?: 'inline' | 'async';
 };
 /**
- * `db` is the root database that was given to `drain` or `worker`: the same object.
- * `run` is `journal.run` on that database. A journal types it as `RootCommandRunner`
- * (in `api.ts`). This file cannot name a command, so the type comes in as `Run`.
+ * `ctx.accept` of a command or an effect: marks one refusal that this handler's `write` or
+ * `run` returned as handled, so the handler may still return a success. Check the value
+ * first, then accept it: `if (OutOfStock.is(r)) { accept(r); ... }`. One call clears one
+ * return of that very value. It commits nothing by itself: a returned failure still rolls back.
+ * A value the handler never received, a second call for one return, a call after the
+ * handler finished, or a value that is not a failure throws `INVALID_ACCEPT`.
  */
-export type EffectContext<AppDb = RootDb, Run = unknown> = {
+export type AcceptFailure = (failure: Failure) => void;
+/**
+ * What an effect handler sees. `db` is the root database that was given to `drain` or `worker`: the same object.
+ * An effect only reaches out (mail, push, webhooks, outside APIs), so it has no `run`: a command that follows an event
+ * is a `j.task` or a `j.workflow` with `startOn`, which checkpoints each step and can undo it.
+ */
+export type EffectContext<AppDb = RootDb> = {
     readonly jobId: string;
+    /** 1 on the first try of this job, 2 on the next, and so on. The number of the attempt row this worker holds open. */
+    readonly attempt: number;
     readonly signal: AbortSignal;
     readonly db: AppDb;
-    readonly run: Run;
 };
 declare const needType: unique symbol;
 /**
@@ -307,6 +337,11 @@ export type Services = Readonly<Record<string, unknown>>;
 export type HandlerRef = {
     readonly kind: 'effect' | 'tap';
     readonly name: string;
+    /**
+     * Set only when `workflow.step` asks: the `name@version` of one registered workflow. Each workflow
+     * gets the services of the feature that declared it, so a need name may mean two services.
+     */
+    readonly workflow?: string;
 };
 /**
  * The services of each effect and tap, given where they run instead of where the journal
@@ -332,15 +367,37 @@ export type ServicesFor<E extends readonly {
  * When an effect's jobs run. `priority`: higher first among due jobs; strict, so a
  * steady stream of high-priority jobs can starve lower ones. `delaySeconds`: due that
  * long after the write's transaction started (`now()` in Postgres). `runAt`: due at the
- * time the event names, from the app's clock. Retries keep their backoff and priority.
+ * time the event names, from the app's clock. `retry`: the backoff between tries.
+ * Retries keep their priority.
  */
 export type EffectSchedule<Meta = unknown> = {
-    readonly priority?: number;
+    /**
+     * An integer within 32 bits, or a function of the event that gives one, so each job can have its own. Bivariant,
+     * like the method signatures below, so an effect of one meta type is still an `Effect<unknown>`.
+     */
+    readonly priority?: number | BivariantFn<[event: Recorded<string, unknown, Meta>], number>;
     readonly delaySeconds?: number;
+    /**
+     * When a failed job runs again, and how long it waits first: a `backoff` from
+     * `@arki/resilience` (re-exported here). A job the backoff stops is dead. A handler that
+     * returns a failure dies at once, unless the backoff's `while` accepts that failure. Default:
+     * `backoff.exponential({ base: 1000, max: 300_000, jitter: 0.25 }).upTo(7)`, so 8 tries.
+     */
+    readonly retry?: Backoff;
+    /**
+     * How long this effect's finished jobs are kept in the archive, overriding the journal's `retention`
+     * for this effect only. `{ completed: false }` keeps no record of its successes.
+     */
+    readonly retention?: EffectRetention;
     /** A method signature, so an effect of one meta type is still an `Effect<unknown>`; see `BivariantFn`. */
     runAt?(event: Recorded<string, unknown, Meta>): Date;
+    /**
+     * Jobs are made only for the events where this returns true. Default: every event of the effect's types.
+     * A method signature, like `runAt`.
+     */
+    when?(event: Recorded<string, unknown, Meta>): boolean;
 };
-export type Effect<Meta = unknown, AppDb = RootDb, Run = unknown, N extends Needs = NoNeeds> = {
+export type Effect<Meta = unknown, AppDb = RootDb, N extends Needs = NoNeeds> = {
     readonly name: string;
     readonly entities: readonly AnyEntity<Meta>[];
     readonly types: ReadonlySet<string>;
@@ -348,11 +405,12 @@ export type Effect<Meta = unknown, AppDb = RootDb, Run = unknown, N extends Need
     readonly needs: N;
     readonly schedule: EffectSchedule<Meta>;
     /** The same effect with this schedule. `j.effect('mail', order, handlers).withSchedule({ priority: 5 })`. */
-    withSchedule(schedule: EffectSchedule<Meta>): Effect<Meta, AppDb, Run, N>;
+    withSchedule(schedule: EffectSchedule<Meta>): Effect<Meta, AppDb, N>;
+    /** Resolves with what the handler returned. A returned failure (`@arki/failure`) fails the job. */
     readonly run: BivariantFn<[
         event: Recorded<string, unknown, Meta>,
-        ctx: EffectContext<AppDb, Run> & Needed<N>
-    ], Promise<void>>;
+        ctx: EffectContext<AppDb> & Needed<N>
+    ], Promise<unknown>>;
 };
 export type EntityInfo = {
     readonly kind: string;
@@ -410,6 +468,20 @@ export type CommandHookContext<MetaOut = unknown> = {
     /** The idempotency key of this call, or null. A hook sees a replayed call too: its handler does not run. */
     readonly idempotencyKey: string | null;
 };
+/**
+ * What a step hook sees: which run, which node, which try, and whether the body (`do`) or the undo runs. Frozen. The
+ * run's input and the step's results stay out, as they do from the `journal.step` span.
+ */
+export type StepHookContext = {
+    readonly workflow: string;
+    readonly version: number;
+    readonly runId: string;
+    /** The node's name. */
+    readonly step: string;
+    /** 1 on the step's first try, 2 on its next, and so on. */
+    readonly attempt: number;
+    readonly phase: StepPhase;
+};
 /** What an effect hook sees. Frozen. `attempt` counts from 1. */
 export type EffectHookContext<Meta = unknown> = {
     readonly name: string;
@@ -417,10 +489,40 @@ export type EffectHookContext<Meta = unknown> = {
     readonly jobId: string;
     readonly attempt: number;
 };
-/** Pending jobs for one effect name that the journal has no effect for. */
+/**
+ * Pending jobs no handler of this worker can claim, per kind and name: an effect this
+ * journal does not have, or a queue job the runner does not know.
+ */
 export type StrandedJobs = {
-    readonly effect: string;
+    readonly kind: JobKind;
+    readonly name: string;
     readonly jobs: number;
+};
+/** One `kind = 'queue'` row as the worker hands it to a runner. `args` is the stored JSON, not yet parsed. */
+export type ScheduledJob = {
+    /** `job_xxx`. Stable across retries: pass it on as an idempotency key. */
+    readonly id: string;
+    /** The persisted job name, e.g. `'discovery:run'`. */
+    readonly name: string;
+    readonly args: unknown;
+    /** 1 on the first try. */
+    readonly attempt: number;
+};
+/**
+ * What runs `kind = 'queue'` rows. The worker claims only rows whose name is in `names`,
+ * under the same lease, renewal and fenced ack as effect jobs. `@arki/queue/outbox` ships one.
+ */
+export type JobRunner<AppDb extends RootDb = RootDb> = {
+    readonly names: readonly string[];
+    /** Return a success to ack the row, or a failure to fail this try. `signal` aborts on `stop()` or a lost lease. */
+    run(job: ScheduledJob, ctx: {
+        readonly db: AppDb;
+        readonly signal: AbortSignal;
+    }): Promise<unknown>;
+    /** Milliseconds before the next try, or `undefined` for dead. Called with the returned failure or thrown error. */
+    retryDelay(job: ScheduledJob, error: unknown): number | undefined;
+    /** Overrides the journal's archive policy for this job. `undefined` takes the journal's. */
+    retention?(job: ScheduledJob): EffectRetention | undefined;
 };
 export {};
 //# sourceMappingURL=types.d.ts.map

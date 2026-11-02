@@ -1,15 +1,20 @@
 export { initJournal } from './journal.js';
 export { need } from './handlers.js';
+// Retry schedules for `EffectSchedule.retry`, from @arki/resilience
+export { backoff } from '@arki/resilience';
+export type { Backoff } from '@arki/resilience';
 export type {
   Command,
   CommandAuthorize,
   CommandContext,
   CommandOptions,
   CommandRunner,
+  CommandWrite,
   Journal,
   JournalDefinitions,
+  LimitOps,
   ReplayResult,
-  RootCommandRunner,
+  WorkflowCommandRunner,
   RunOptions,
   CallOptions,
   VerifyResult,
@@ -19,10 +24,26 @@ export type {
   WriteOptions,
   WriteResult,
 } from './api.js';
-export { CommandError, JournalError, isCommandError, isJournalError } from './errors.js';
-export type { CommandErrorCode, JournalErrorCode } from './errors.js';
+export {
+  COMMAND_FAILURES,
+  CommandConflict,
+  CommandForbidden,
+  CommandInvalid,
+  CommandNotFound,
+  JournalError,
+  WorkflowBusy,
+  WorkflowPending,
+  WorkflowReadMismatch,
+  WorkflowRunCancelled,
+  WorkflowRunFailed,
+  WorkflowStranded,
+  WorkflowTransitionLimit,
+  isJournalError,
+} from './errors.js';
+export type { CommandFailure, JournalErrorCode } from './errors.js';
 export type { GuaranteedCreateKeys, EntityBuilder, OnReducerRow, OnOnlyEntityBuilder } from './entity.js';
 export type {
+  AcceptFailure,
   AnyEntity,
   AnyEventDef,
   CreateReducer,
@@ -35,6 +56,7 @@ export type {
   EntityIdOf,
   EntityInfo,
   EntityTable,
+  EventStorage,
   EventDef,
   EventOptions,
   Upcaster,
@@ -47,6 +69,7 @@ export type {
   WakeListener,
   CommandHookContext,
   EffectHookContext,
+  StepHookContext,
   EventsOf,
   IdTable,
   KeyColumn,
@@ -72,9 +95,86 @@ export type {
   HandlerServices,
   TransactionSource,
   JournalWorker,
+  JobRunner,
+  ScheduledJob,
   StrandedJobs,
 } from './types.js';
+export type {
+  ArchivedJob,
+  JobAttempt,
+  JobCount,
+  JobDetail,
+  JobFilter,
+  JobOperation,
+  JobOperationInput,
+  JobSelection,
+  JobState,
+} from './outbox.js';
+export type {
+  ArchiveObjectStore,
+  ArchiveSink,
+  EffectRetention,
+  JobRetention,
+  Keep,
+  RetentionAge,
+  RunRetention,
+} from './retention.js';
+export { ndjsonArchiveSink } from './retention.js';
+export type {
+  BatchSummary,
+  HistoryEvent,
+  RunCount,
+  RunDetail,
+  RunState,
+  RunSummary,
+  StepView,
+  StrandedReason,
+  StrandedRun,
+  WorkflowOps,
+  WorkflowReads,
+  WorkflowVerbs,
+} from './workflow/read.js';
+export type { WorkflowShape } from './workflow/shape.js';
+export type { LifecycleHookContext, LifecycleHooks, RunEnding, WorkflowDef } from './workflow/define.js';
+export type { ReplayArgs, ReplayOverrides, StartBatchOutcome, WorkflowStarter } from './workflow/run-types.js';
+export {
+  BATCH_LIMIT,
+  RUN_FIELD_LIMITS,
+  RUN_OVERRIDE_LIMITS,
+  type MetadataChange,
+  type MetadataContext,
+  type MetadataOutcome,
+  type RunFields,
+  type RunMetadata,
+  type RunOverrides,
+  type TagsContext,
+  type TagsOutcome,
+} from './workflow/run-fields.js';
+export {
+  LIMIT_BOUNDS,
+  LIMIT_KEY_TTL,
+  WORKFLOW_LIMIT_PREFIX,
+  type LimitBusyReason,
+  type LimitDef,
+  type LimitKeyView,
+  type LimitNameArgs,
+  type LimitOverrideArgs,
+  type LimitResetArgs,
+  type LimitValues,
+  type LimitView,
+} from './workflow/limit-types.js';
+export { LIMIT_BUSY_REASONS } from './workflow/states.js';
+export { jobId } from './id.js';
+export { combineRunners } from './runners.js';
 export type { JournalTables } from './pg.js';
+export type {
+  EventLogPosition,
+  EventLog,
+  EventLogReads,
+  EventLogWrites,
+  EventToAppend,
+  ForwardLag,
+  ProjectionCursor,
+  StoredEvent,
+} from './event-log.js';
 export type { Around, HookPoint } from './hooks.js';
-export { listenOnPool } from './listen.js';
-export type { ListenClient, ListenPool } from './listen.js';

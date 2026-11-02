@@ -1,0 +1,1 @@
+{"version":3,"file":"kurrentdb.d.ts","sourceRoot":"","sources":["../src/kurrentdb.ts"],"names":[],"mappings":"AAAA;;;;;GAKG;AACH,OAAO,KAAK,EAAE,eAAe,EAA2B,MAAM,2BAA2B,CAAC;AAgB1F,OAAO,KAAK,EAAmC,YAAY,EAAe,MAAM,gBAAgB,CAAC;AAqEjG;;;;;GAKG;AACH,wBAAgB,aAAa,CAAC,IAAI,EAAE;IAAE,QAAQ,CAAC,MAAM,EAAE,eAAe,CAAC;IAAC,QAAQ,CAAC,MAAM,CAAC,EAAE,MAAM,CAAA;CAAE,GAAG,YAAY,CAsIhH"}

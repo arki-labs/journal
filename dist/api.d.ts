@@ -1,21 +1,32 @@
 /**
  * The public declarations: the `Journal` object, commands and their context, the
  * definition helpers `initJournal` returns, and the input, option and result types.
- * Types only, no runtime code. May import `entity`, `types` and `pg`; nothing else.
+ * Types only, no runtime code. May import `entity`, `types`, `pg`, `outbox` and `retention` (types); nothing else.
  */
-import type { z } from 'zod';
+import type { IdGenerationFailure } from '@arki/contracts';
+import type { Failure, SchemaFailure } from '@arki/failure';
+import type { SchemaInput, SchemaOutput, StandardSchemaV1 } from '@arki/schema';
 import type { EntityBuilder } from './entity.js';
+import type { CommandFailure, CommandInvalid, CommandNotFound } from './errors.js';
+import type { EventLog, EventLogPosition, ForwardLag, ProjectionCursor } from './event-log.js';
 import type { HookPoint } from './hooks.js';
-import type { JournalTables } from './pg.js';
-import type { AnyEntity, AnyEventDef, CommandHookContext, DbHandle, Effect, EffectHandlers, EffectHookContext, EntityDef, EntityId, EntityInfo, EntityTable, EventDef, EventOptions, HandlerServices, IdTable, JournalWorker, KeyName, Needs, PendingOf, Projection, ProjectionHandlers, ProjectionOptions, RecordedOf, ReducerRow, RootDb, Row, Services, ServicesFor, SingleKey, StrandedJobs, Tap, TapHandlers, TransactionSource, WakeListener } from './types.js';
+import type { JobOperationInput, JobOps } from './outbox.js';
+import type { ResolvedRetention } from './retention.js';
+import type { AcceptFailure, AnyEntity, AnyEventDef, BivariantFn, CommandHookContext, DbHandle, Effect, EffectHandlers, EffectHookContext, EntityDef, EntityId, EntityInfo, EntityTable, EventDef, EventOptions, EventsOf, EventStorage, HandlerServices, IdTable, JobRunner, JournalWorker, KeyName, Needs, NoNeeds, PendingOf, Projection, ProjectionHandlers, ProjectionOptions, RecordedOf, ReducerRow, RootDb, Row, Services, ServicesFor, SingleKey, StepHookContext, StrandedJobs, Tap, TapHandlers, TransactionSource, WakeListener } from './types.js';
+import type { FinishBound, NoResults, Resolved, StartOn, StartTiming, TaskBody, TaskDef, TaskOptions, WorkflowBuilder, WorkflowDef, WorkflowOptions, WorkflowServices } from './workflow/define.js';
+import type { LimitDef, LimitNameArgs, LimitOverrideArgs, LimitResetArgs, LimitView } from './workflow/limit-types.js';
+import type { WorkflowOps } from './workflow/read.js';
+import type { StarterOf } from './workflow/run-types.js';
 /**
  * Looks at the locked row, checks the rules, and returns the events to append.
  * Runs after the row is locked, inside the write's savepoint. `tx` is that
- * savepoint: reads through it see the locked row's transaction.
+ * savepoint: reads through it see the locked row's transaction. Return a failure
+ * (`@arki/failure`) when a rule says no: the savepoint rolls back, nothing is
+ * written, and the write returns that failure.
  */
-export type NextEvents<Tbl extends EntityTable, E extends AnyEventDef, Tx = DbHandle> = (row: Row<Tbl> | null, ctx: {
+export type NextEvents<Tbl extends EntityTable, E extends AnyEventDef, Tx = DbHandle, Returned extends readonly (PendingOf<E> | SchemaFailure)[] | Failure = readonly (PendingOf<E> | SchemaFailure)[]> = (row: Row<Tbl> | null, ctx: {
     readonly tx: Tx;
-}) => readonly PendingOf<E>[] | Promise<readonly PendingOf<E>[]>;
+}) => Returned | Promise<Returned>;
 /** Options of a write, from `journal.write` or a command's `write`. */
 export type WriteOptions = {
     /**
@@ -25,40 +36,59 @@ export type WriteOptions = {
      */
     readonly expectedVersion?: number;
 };
-export type WriteInput<Tbl extends EntityTable, E extends AnyEventDef, Meta extends z.ZodObject, Tx = DbHandle> = WriteOptions & {
-    readonly meta: z.input<Meta>;
-    readonly events: NextEvents<Tbl, E, Tx>;
+export type WriteInput<Tbl extends EntityTable, E extends AnyEventDef, Meta extends StandardSchemaV1<unknown, Record<string, unknown>>, Tx = DbHandle, Returned extends readonly (PendingOf<E> | SchemaFailure)[] | Failure = readonly (PendingOf<E> | SchemaFailure)[]> = WriteOptions & {
+    readonly meta: SchemaInput<Meta>;
+    readonly events: NextEvents<Tbl, E, Tx, Returned>;
 };
 /**
- * A command: a name, an input schema and a handler. `j.command` makes one;
- * `journal.run` runs it. `name` and `input` are for the app (an oRPC procedure
- * can reuse or `.pick` the schema). The handler is for `journal.run` only.
+ * A command: a name, an input schema, the events it writes and a handler. `j.command`
+ * makes one; `journal.run` runs it. `name`, `input` and `writes` are for the app (an oRPC
+ * procedure can reuse or `.pick` the schema). The handler is for `journal.run` only.
  */
-export type Command<S extends z.ZodType, R, in MetaOut, in Tx extends TransactionSource<Tx> = DbHandle> = {
+export type Command<S extends StandardSchemaV1, R, in MetaOut, in Tx extends TransactionSource<Tx> = DbHandle, out Writes extends readonly AnyEventDef[] = readonly AnyEventDef[], out Output extends StandardSchemaV1 | undefined = StandardSchemaV1 | undefined> = {
     readonly name: string;
     readonly input: S;
-    readonly handler: (input: z.output<S>, context: CommandContext<MetaOut, Tx>) => R;
-    /** The command's `authorize` option, when it has one. See {@link CommandOptions}. */
-    readonly authorize?: CommandAuthorize<z.output<S>, MetaOut, Tx>;
+    /** The events this command writes, as declared: readable before boot. A child command's events are its own. */
+    readonly writes: Writes;
+    /** What a workflow's command node stores of the result. See {@link CommandOptions}. */
+    readonly output?: Output;
+    /** Bivariant, so a workflow's command node can keep a command in an erased slot and run it without a cast. */
+    readonly handler: BivariantFn<[input: SchemaOutput<S>, context: CommandContext<MetaOut, Tx, Writes[number]>], R>;
+    /** The command's `authorize` option, when it has one. See {@link CommandOptions}. Its failures are part of `R`. */
+    readonly authorize?: CommandAuthorize<SchemaOutput<S>, MetaOut, Tx, void | R>;
 };
 /**
  * Decides whether the caller may run a command. It runs inside the command's transaction,
  * after the input and `meta` are parsed, on every call: a call that replays an idempotency
- * receipt runs it too, before the stored result is returned. Throw (a `CommandError`
- * `FORBIDDEN`, usually) to refuse; the run rolls back and nothing is replayed.
+ * receipt runs it too, before the stored result is returned. Return a failure
+ * (`CommandForbidden`, usually) to refuse: the run rolls back, nothing is replayed,
+ * and `journal.run` returns that failure. A throw refuses too.
  */
-export type CommandAuthorize<Input, in MetaOut, in Tx extends TransactionSource<Tx> = DbHandle> = (input: Input, context: {
+export type CommandAuthorize<Input, in MetaOut, in Tx extends TransactionSource<Tx> = DbHandle, Refused = void> = (input: Input, context: {
     readonly tx: Tx;
     readonly meta: MetaOut;
-}) => void | Promise<void>;
+}) => Refused | Promise<Refused>;
 /** Options of `j.command`. */
-export type CommandOptions<Input, MetaOut, Tx extends TransactionSource<Tx> = DbHandle> = {
+export type CommandOptions<Input, MetaOut, Tx extends TransactionSource<Tx> = DbHandle, Refused extends void | undefined | Failure = void, Writes extends readonly AnyEventDef[] = readonly AnyEventDef[], Output extends StandardSchemaV1 | undefined = undefined> = {
+    /**
+     * The events the handler may write. Required: `[]` is a command that only runs child commands.
+     * `write` takes nothing else, and an event that gets past the types fails the run with
+     * `BAD_DEFINITION` before it is stored.
+     */
+    readonly writes: Writes;
+    /**
+     * What a workflow's command node stores of the handler's result, as `results.<node>`, checked again by `def.read`.
+     * A persisted outcome needs a runtime schema, and TypeScript cannot make one from a handler's return, so a command
+     * that hands a result to a workflow declares it here. Its output must fit the handler's success and survive JSON.
+     * A command node stores `null` for a command without it. `journal.run` does not use it.
+     */
+    readonly output?: Output;
     /**
      * Put the caller's permission check here, not in the handler. A repeat with an idempotency
      * key does not run the handler, so a check inside it would not run either: the stored result
      * would go to whoever replays the key. `authorize` runs on the first call and on every replay.
      */
-    readonly authorize?: CommandAuthorize<Input, MetaOut, Tx>;
+    readonly authorize?: CommandAuthorize<Input, MetaOut, Tx, Refused>;
 };
 /**
  * What a command handler receives. `write` and `run` are bound to the command's
@@ -66,13 +96,13 @@ export type CommandOptions<Input, MetaOut, Tx extends TransactionSource<Tx> = Db
  * needed: the two types refer to each other, and TypeScript cannot measure the
  * variance of such a pair on its own.
  */
-/** Options of one call: `journal.run`, a bound runner, a command's `run`, an effect's `ctx.run`. */
+/** Options of one call: `journal.run`, a bound runner, a command's `run`, a workflow step's `ctx.run`. */
 export type CallOptions = {
     /**
      * Makes the call idempotent. The first run with this key records its result in
      * `journal_receipts`, in its own transaction. A later run with the same key and the same
      * input returns that result without running the handler; the same key with another input
-     * or another command is `CONFLICT`. The result must survive JSON storage, or the first run
+     * or another command returns `CommandConflict`. The result must survive JSON storage, or the first run
      * fails with `UNSTABLE_SCHEMA`. Scope a key from outside to its caller: `${tenant}:${id}`.
      */
     readonly idempotencyKey?: string;
@@ -80,12 +110,27 @@ export type CallOptions = {
 /** Options of `journal.run` and `journal.bind`. */
 export type RunOptions = CallOptions & {
     /**
+     * With `idempotencyKey` on `journal.bind`: each command the bound runner runs uses
+     * `${idempotencyKey}:${command.name}` as its key. One request key then covers a procedure
+     * that runs several commands, and each command has its own receipt. A key given per call
+     * (`run(command, input, { idempotencyKey })`) is used as it stands.
+     */
+    readonly keyPerCommand?: boolean;
+    /**
      * Seeds the chain's correlation id, for example with the request id. Without it, a run
-     * from an effect continues the cause event's chain, and any other run starts a new one.
+     * from a workflow step continues the cause event's chain, and any other run starts a new one.
      */
     readonly correlationId?: string;
 };
-export type CommandContext<out MetaOut, out Tx extends TransactionSource<Tx> = DbHandle> = {
+/**
+ * The type of `context.write`. `events` returns events of `entity` that the command declares in `writes`.
+ * A helper that takes `write` names what it writes: `CommandWrite<Meta, Tx, typeof OrderPlaced>`, and a
+ * command can pass its own `write` only when it declares at least those events.
+ * This is an alias with `Declared` annotated because TypeScript erases the type parameters when it compares two
+ * instantiations of one function type, and `Declared` sits in a constraint: without the alias nothing compares it.
+ */
+export type CommandWrite<out MetaOut, out Tx extends TransactionSource<Tx> = DbHandle, in Declared extends AnyEventDef = AnyEventDef> = <K extends string, Tbl extends EntityTable, E extends AnyEventDef, Key extends string, Returned extends readonly ((PendingOf<E> & PendingOf<Declared>) | SchemaFailure)[] | Failure>(entity: EntityDef<K, Tbl, E, MetaOut, Key>, id: EntityId<Tbl, Key>, events: NextEvents<Tbl, E, Tx, Returned>, opts?: WriteOptions) => Promise<WriteResult<Tbl, E, MetaOut, Key> | Extract<Returned, Failure> | SchemaFailure | IdGenerationFailure>;
+export type CommandContext<out MetaOut, out Tx extends TransactionSource<Tx> = DbHandle, in Declared extends AnyEventDef = AnyEventDef> = {
     /** The command's transaction. Use it for reads and for writes outside any entity. */
     readonly tx: Tx;
     /** The parsed metadata every `write` in this command records. */
@@ -94,10 +139,20 @@ export type CommandContext<out MetaOut, out Tx extends TransactionSource<Tx> = D
     readonly commandId: string;
     /** The chain this run belongs to. Every event it writes carries it; a child run inherits it. */
     readonly correlationId: string;
-    /** `journal.write` on this command's transaction with this command's metadata. Safe to destructure. */
-    readonly write: <K extends string, Tbl extends EntityTable, E extends AnyEventDef, Key extends string>(entity: EntityDef<K, Tbl, E, MetaOut, Key>, id: EntityId<Tbl, Key>, events: NextEvents<Tbl, E, Tx>, opts?: WriteOptions) => Promise<WriteResult<Tbl, E, MetaOut, Key>>;
+    /**
+     * `journal.write` on this command's transaction with this command's metadata. Safe to destructure.
+     * A failure `events` returns comes back here: return it from the handler, and the command rolls back.
+     */
+    readonly write: CommandWrite<MetaOut, Tx, Declared>;
     /** Run another command in a savepoint of this transaction, with the same metadata. Safe to destructure. */
-    readonly run: <S extends z.ZodType, R>(command: Command<S, R, MetaOut, Tx>, input: NoInfer<z.input<S>>, opts?: CallOptions) => Promise<Awaited<R>>;
+    readonly run: <S extends StandardSchemaV1, R>(command: Command<S, R, MetaOut, Tx>, input: NoInfer<SchemaInput<S>>, opts?: CallOptions) => Promise<Awaited<R> | CommandFailure>;
+    /**
+     * Marks a refusal that `write` or `run` returned as handled, so the handler may still return a
+     * success: `if (OutOfStock.is(r)) { accept(r); ... }`. Without it, a success after a refusal
+     * throws `IGNORED_FAILURE`. Only this command's own check is lifted: a refused child's
+     * savepoint stays rolled back. Safe to destructure. See `AcceptFailure`.
+     */
+    readonly accept: AcceptFailure;
 };
 /**
  * The type of `context.run`. Use it in app code that passes `run` on, so the
@@ -105,11 +160,32 @@ export type CommandContext<out MetaOut, out Tx extends TransactionSource<Tx> = D
  */
 export type CommandRunner<MetaOut, Tx extends TransactionSource<Tx> = DbHandle> = CommandContext<MetaOut, Tx>['run'];
 /**
- * The type of an effect's `ctx.run`: `journal.run` without `source`. It runs on the
- * root database the worker or `drain` was given, in its own transaction. `meta`
- * is required, as in `journal.run`: the library never picks an actor.
+ * A command runner on the root database. `MetaArgs` are the arguments after `input`: the meta, then the call options.
+ * The signature is written here once; `RootCommandRunner` and `WorkflowCommandRunner` differ only in whether the meta
+ * may be left out.
  */
-export type RootCommandRunner<Meta extends z.ZodObject, Tx extends TransactionSource<Tx> = DbHandle> = <S extends z.ZodType, R>(command: Command<S, R, z.output<Meta>, Tx>, input: NoInfer<z.input<S>>, meta: z.input<Meta>, opts?: CallOptions) => Promise<Awaited<R>>;
+type RootRunnerWith<Meta extends StandardSchemaV1<unknown, Record<string, unknown>>, Tx extends TransactionSource<Tx>, MetaArgs extends readonly unknown[]> = <S extends StandardSchemaV1, R>(command: Command<S, R, SchemaOutput<Meta>, Tx>, input: NoInfer<SchemaInput<S>>, ...metaArgs: MetaArgs) => Promise<Awaited<R> | CommandFailure>;
+/**
+ * The `ctx.run` of the engine's own effects: `journal.run` without `source`. It runs on the
+ * root database the worker or `drain` was given, in its own transaction. `meta`
+ * is required, as in `journal.run`: the library never picks an actor, so the caller names it.
+ * Only a workflow body's `ctx.run` may leave it out, and then the app chose it: the `workflowMeta` of `compose`.
+ */
+export type RootCommandRunner<Meta extends StandardSchemaV1<unknown, Record<string, unknown>>, Tx extends TransactionSource<Tx> = DbHandle> = RootRunnerWith<Meta, Tx, [meta: SchemaInput<Meta>, opts?: CallOptions]>;
+/**
+ * The type of `ctx.run` in a workflow body (a step, an undo, a `when`, a `key`, a `next`, a child's `input`).
+ * `meta` may be left out: the command then records the `workflowMeta` the app passed to
+ * `compose({ workflows, workflowMeta })`. The library still never invents an actor: the app chose `workflowMeta`.
+ * A meta passed here is used as given.
+ */
+export type WorkflowCommandRunner<Meta extends StandardSchemaV1<unknown, Record<string, unknown>>, Tx extends TransactionSource<Tx> = DbHandle> = RootRunnerWith<Meta, Tx, [meta?: SchemaInput<Meta>, opts?: CallOptions]>;
+/** What a workflow body sees of the app: its database and a `ctx.run` that may leave out the meta. */
+type WorkflowHost<Meta extends StandardSchemaV1<unknown, Record<string, unknown>>, Tx extends TransactionSource<Tx>, AppDb> = {
+    readonly db: AppDb;
+    readonly run: WorkflowCommandRunner<Meta, Tx>;
+    /** The context a command of this journal takes, so a command node takes only those. */
+    readonly commandContext: CommandContext<SchemaOutput<Meta>, Tx>;
+};
 export type WriteResult<Tbl extends EntityTable, E extends AnyEventDef, MetaOut, Key extends string = 'id'> = {
     readonly row: Row<Tbl> | null;
     readonly events: RecordedOf<E, MetaOut, EntityId<Tbl, Key>>[];
@@ -131,16 +207,22 @@ export type VerifyResult<Tbl extends EntityTable, Key extends string = 'id'> = {
     readonly expected: ReducerRow<Tbl, Key> | null;
     readonly actual: Row<Tbl> | null;
 };
-export type Journal<Meta extends z.ZodObject, Tx extends TransactionSource<Tx> = DbHandle, AppDb extends RootDb = RootDb> = {
-    /** Append events, run reducers, save the row, run projections, queue jobs. All inside `tx`. */
-    write<K extends string, Tbl extends EntityTable, E extends AnyEventDef, Key extends string>(tx: Tx, entity: EntityDef<K, Tbl, E, z.output<Meta>, Key>, id: EntityId<Tbl, Key>, input: WriteInput<Tbl, E, Meta, Tx>): Promise<WriteResult<Tbl, E, z.output<Meta>, Key>>;
+export type Journal<Meta extends StandardSchemaV1<unknown, Record<string, unknown>>, Tx extends TransactionSource<Tx> = DbHandle, AppDb extends RootDb = RootDb> = {
+    /**
+     * Append events, run reducers, save the row, run projections, queue jobs. All inside `tx`.
+     * A failure `events` returns is the result: the write's savepoint rolled back.
+     */
+    write<K extends string, Tbl extends EntityTable, E extends AnyEventDef, Key extends string, Returned extends readonly (PendingOf<E> | SchemaFailure)[] | Failure>(tx: Tx, entity: EntityDef<K, Tbl, E, SchemaOutput<Meta>, Key>, id: EntityId<Tbl, Key>, input: WriteInput<Tbl, E, Meta, Tx, Returned>): Promise<WriteResult<Tbl, E, SchemaOutput<Meta>, Key> | Extract<Returned, Failure> | SchemaFailure | IdGenerationFailure>;
     /**
      * Parse `input` and `meta`, then call the command's handler inside one
      * transaction of `source`. A root database opens a transaction; a transaction
-     * opens a savepoint. Returns what the handler returns. Errors pass through.
+     * opens a savepoint. Returns what the handler returns. Unexpected callback
+     * exceptions and runtime invariants return typed transaction failures with a private cause.
+     * A returned failure (`@arki/failure`) rolls the transaction back like a throw, and is
+     * returned, the same instance.
      * On a root database, a run that queued a job calls `wake()` after the commit.
      */
-    run<S extends z.ZodType, R>(source: TransactionSource<Tx>, command: Command<S, R, z.output<Meta>, Tx>, input: NoInfer<z.input<S>>, meta: z.input<Meta>, opts?: RunOptions): Promise<Awaited<R>>;
+    run<S extends StandardSchemaV1, R>(source: TransactionSource<Tx>, command: Command<S, R, SchemaOutput<Meta>, Tx>, input: NoInfer<SchemaInput<S>>, meta: SchemaInput<Meta>, opts?: RunOptions): Promise<Awaited<R> | CommandFailure>;
     /**
      * The command door: `run` with `source` and `meta` fixed. It returns
      * `(command, input) => journal.run(source, command, input, meta)`. A request
@@ -152,7 +234,7 @@ export type Journal<Meta extends z.ZodObject, Tx extends TransactionSource<Tx> =
      * `run`: a default in the meta schema gives each command its own value, and
      * a bad `meta` rejects the call, inside the transaction guard, as `run` does.
      */
-    bind(source: TransactionSource<Tx>, meta: z.input<Meta>, opts?: RunOptions): CommandRunner<z.output<Meta>, Tx>;
+    bind(source: TransactionSource<Tx>, meta: SchemaInput<Meta>, opts?: RunOptions): CommandRunner<SchemaOutput<Meta>, Tx>;
     /**
      * Bring a row that existed before the journal into it. The row must be at version 0
      * with no history, or `CONFLICT`. `events` builds exactly one create event from the
@@ -162,13 +244,13 @@ export type Journal<Meta extends z.ZodObject, Tx extends TransactionSource<Tx> =
      * so `replay`, `verify` and `repair` work from then on. Projections run and effects
      * are queued as for any write, because the event is the app's own.
      */
-    adopt<K extends string, Tbl extends EntityTable, E extends AnyEventDef, Key extends string>(tx: Tx, entity: EntityDef<K, Tbl, E, z.output<Meta>, Key>, id: EntityId<Tbl, Key>, input: WriteInput<Tbl, E, Meta, Tx>): Promise<WriteResult<Tbl, E, z.output<Meta>, Key>>;
+    adopt<K extends string, Tbl extends EntityTable, E extends AnyEventDef, Key extends string>(tx: Tx, entity: EntityDef<K, Tbl, E, SchemaOutput<Meta>, Key>, id: EntityId<Tbl, Key>, input: WriteInput<Tbl, E, Meta, Tx>): Promise<WriteResult<Tbl, E, SchemaOutput<Meta>, Key> | SchemaFailure | IdGenerationFailure>;
     /** Rebuild the row from the log in memory. `throughVersion` is the last version applied. */
-    replay<K extends string, Tbl extends EntityTable, E extends AnyEventDef, Key extends string>(db: DbHandle, entity: EntityDef<K, Tbl, E, z.output<Meta>, Key>, id: EntityId<Tbl, Key>, opts?: {
+    replay<K extends string, Tbl extends EntityTable, E extends AnyEventDef, Key extends string>(db: DbHandle, entity: EntityDef<K, Tbl, E, SchemaOutput<Meta>, Key>, id: EntityId<Tbl, Key>, opts?: {
         readonly throughVersion?: number;
-    }): Promise<ReplayResult<Tbl, E, z.output<Meta>, Key>>;
+    }): Promise<ReplayResult<Tbl, E, SchemaOutput<Meta>, Key> | SchemaFailure>;
     /** Replay and compare with the stored row on the columns the reducers produce. */
-    verify<K extends string, Tbl extends EntityTable, E extends AnyEventDef, Key extends string>(db: DbHandle, entity: EntityDef<K, Tbl, E, z.output<Meta>, Key>, id: EntityId<Tbl, Key>): Promise<VerifyResult<Tbl, Key>>;
+    verify<K extends string, Tbl extends EntityTable, E extends AnyEventDef, Key extends string>(db: DbHandle, entity: EntityDef<K, Tbl, E, SchemaOutput<Meta>, Key>, id: EntityId<Tbl, Key>): Promise<VerifyResult<Tbl, Key> | SchemaFailure>;
     /**
      * Remove personal data from one entity's history. Every stored event whose definition
      * has an `erased` form gets its `data` rewritten to that form and `erased_at` set; events
@@ -178,17 +260,19 @@ export type Journal<Meta extends z.ZodObject, Tx extends TransactionSource<Tx> =
      * was never adopted) is `NO_HISTORY` and nothing changes. Projections are not rerun, and no
      * job is queued: the app owns its read models. Running it twice is safe.
      */
-    forget<K extends string, Tbl extends EntityTable, E extends AnyEventDef, Key extends string>(db: DbHandle, entity: EntityDef<K, Tbl, E, z.output<Meta>, Key>, id: EntityId<Tbl, Key>): Promise<ForgetResult<Tbl>>;
+    forget<K extends string, Tbl extends EntityTable, E extends AnyEventDef, Key extends string>(db: DbHandle, entity: EntityDef<K, Tbl, E, SchemaOutput<Meta>, Key>, id: EntityId<Tbl, Key>): Promise<ForgetResult<Tbl> | SchemaFailure>;
     /**
      * Delete receipts recorded before `before`. Receipts hold inputs and results, which may
      * carry personal data; `forget` does not touch them, so an app that keys personal flows
-     * prunes on a schedule. Returns how many were deleted.
+     * prunes on a schedule. Unresolved HTTP reservations and unexpired HTTP replays are
+     * retained; reconcile unresolved application work before releasing its reservation.
+     * Returns how many were deleted.
      */
     pruneReceipts(db: DbHandle, opts: {
         readonly before: Date;
-    }): Promise<number>;
+    }): Promise<number | IdGenerationFailure>;
     /** Lock the row, replay, save the result. Writes no event, runs no projection, creates no job. */
-    repair<K extends string, Tbl extends EntityTable, E extends AnyEventDef, Key extends string>(db: DbHandle, entity: EntityDef<K, Tbl, E, z.output<Meta>, Key>, id: EntityId<Tbl, Key>): Promise<Row<Tbl> | null>;
+    repair<K extends string, Tbl extends EntityTable, E extends AnyEventDef, Key extends string>(db: DbHandle, entity: EntityDef<K, Tbl, E, SchemaOutput<Meta>, Key>, id: EntityId<Tbl, Key>): Promise<Row<Tbl> | null | SchemaFailure>;
     /**
      * The async lane of projections: one batch per async projection. Each batch locks the
      * projection's cursor, scans the next `batchSize` events in commit order, applies the
@@ -205,37 +289,53 @@ export type Journal<Meta extends z.ZodObject, Tx extends TransactionSource<Tx> =
      * Rewind an async projection to the start. `clear` runs on the same transaction, after the
      * cursor is locked and before it is rewound, so the read model is emptied and refilled with
      * no batch landing in between. To rebuild without downtime, deploy the projection under a
-     * new name into a new table instead, wait for `cursors` to show lag 0, then switch reads.
+     * new name into a new table instead, wait until `cursors` no longer shows it `behind`, then switch reads.
      */
-    reset(db: RootDb & TransactionSource<Tx>, projection: Projection<z.output<Meta>, Tx>, clear?: (tx: Tx) => Promise<void>): Promise<void>;
-    /** Per async projection: its cursor and how far behind the newest event it is, in seqs. */
-    cursors(db: DbHandle): Promise<readonly {
-        readonly name: string;
-        readonly seq: number;
-        readonly lag: number;
-    }[]>;
-    /** Walk the log after sequence number `afterSeq` and call one inline projection's handlers, a batch per transaction. Async projections use `reset` and `catchUp`. */
-    rerun(db: TransactionSource<Tx>, projection: Projection<z.output<Meta>, Tx>, opts?: {
-        readonly afterSeq?: number;
+    reset(db: RootDb & TransactionSource<Tx>, projection: Projection<SchemaOutput<Meta>, Tx>, clear?: (tx: Tx) => Promise<void>): Promise<void>;
+    /** Per async projection: its position in the log, whether the log holds newer events, and how many positions behind it is when the log can tell. */
+    cursors(db: DbHandle): Promise<readonly ProjectionCursor[]>;
+    /**
+     * How far the forwarded event logs are behind the rows: forward jobs still waiting or dead, and
+     * when the oldest was written. Effects run from the write's own events, so they may run before
+     * the log has them.
+     */
+    forwardLag(db: DbHandle): Promise<ForwardLag>;
+    /**
+     * Copy an entity kind's events from the log it uses now into `to` (`'stored'`: the built-in
+     * log), to switch its store. Pause writes to the kind, copy, flip its `events` setting, then
+     * `reset` the async projections that read it: their positions belong to the old log. The old
+     * log keeps its copy. Refused while forward jobs of the kind wait (`FORWARD_PENDING`) and for a
+     * log without a global order. Safe to run again after a crash: appends repeat as no-ops.
+     */
+    copyLog<K extends string, Tbl extends EntityTable, E extends AnyEventDef, Key extends string>(db: DbHandle, entity: EntityDef<K, Tbl, E, SchemaOutput<Meta>, Key>, opts: {
+        readonly to: 'stored' | EventLog;
         readonly batchSize?: number;
     }): Promise<{
         readonly events: number;
     }>;
+    /** Walk the log after position `after` (`null` or left out: from the start) and call one inline projection's handlers, a batch per transaction. Async projections use `reset` and `catchUp`. */
+    rerun(db: TransactionSource<Tx>, projection: Projection<SchemaOutput<Meta>, Tx>, opts?: {
+        readonly after?: EventLogPosition | null;
+        readonly batchSize?: number;
+    }): Promise<{
+        readonly events: number;
+    } | SchemaFailure>;
     /**
      * Run up to `batchSize` due jobs. Returns how many jobs were claimed. Root database only.
-     * It must open the journal's transaction type: an effect runs commands on it.
+     * It must open the journal's transaction type: a workflow step runs commands on it.
      * Each job is claimed right before it runs, so its lease (`leaseSeconds`, default 60)
      * covers only its own work, and the lease is renewed every half lease while the effect
      * runs. A lost lease aborts the effect's `ctx.signal`.
      * Once `signal` is aborted no further job is claimed; the running one sees it as `ctx.signal`.
-     * `services`: see `worker`.
+     * `services` and `jobs`: see `worker`.
      */
     drain(db: AppDb & RootDb & TransactionSource<Tx>, opts?: {
         readonly batchSize?: number;
         readonly signal?: AbortSignal;
         readonly leaseSeconds?: number;
         readonly services?: HandlerServices;
-    }): Promise<number>;
+        readonly jobs?: JobRunner<AppDb>;
+    }): Promise<number | IdGenerationFailure>;
     /**
      * A loop around `drain`. The same database as `drain`. `stop()` aborts the running
      * effect's `ctx.signal`, claims nothing more, and resolves when that effect returns.
@@ -258,6 +358,12 @@ export type Journal<Meta extends z.ZodObject, Tx extends TransactionSource<Tx> =
          * with its services ignores this.
          */
         readonly services?: HandlerServices;
+        /**
+         * Runs `kind = 'queue'` rows (jobs scheduled by `@arki/queue/outbox`) whose name is in
+         * `jobs.names`, under the same lease and fenced ack as effects. Without it the worker
+         * claims effect rows only, exactly as before.
+         */
+        readonly jobs?: JobRunner<AppDb>;
     }): JournalWorker;
     /**
      * The Postgres channel every commit that recorded events notifies, with the seq range as
@@ -271,26 +377,81 @@ export type Journal<Meta extends z.ZodObject, Tx extends TransactionSource<Tx> =
      */
     wake(): void;
     /**
-     * Pending jobs whose effect this journal does not have, counted per effect name.
+     * Pending jobs no handler can claim, counted per kind and name: effect rows whose effect
+     * this journal does not have and, given the worker's `jobs` runner, queue rows whose name
+     * it does not know. Without `jobs`, queue rows are not counted.
      * `drain` leaves them alone, because during a rolling deploy an older worker may
-     * still have that effect. After the deploy, a non-empty list means an effect was
+     * still have that handler. After the deploy, a non-empty list means a handler was
      * renamed or removed while it had jobs: bring it back under its old name until
      * the count is zero, or delete those job rows on purpose.
      */
-    strandedJobs(db: DbHandle): Promise<readonly StrandedJobs[]>;
+    strandedJobs(db: DbHandle, opts?: {
+        readonly jobs?: Pick<JobRunner, 'names'>;
+    }): Promise<readonly StrandedJobs[]>;
     /**
-     * List job rows. `pending` (the default) is everything not dead: due, delayed and leased
-     * alike. `dead` is what the worker gave up on. Oldest due first, `limit` 100.
+     * The resolved archive policy: the `retention` option of `initJournal` with its defaults filled in. The one source the
+     * worker, the verbs and the sweeper read.
      */
-    jobs(db: DbHandle, opts?: {
-        readonly status?: 'pending' | 'dead' | 'all';
-        readonly effect?: string;
-        readonly limit?: number;
-    }): Promise<JournalTables['jobs']['$inferSelect'][]>;
-    /** A dead job back to pending: attempts and lease cleared, due now, workers woken. A job that is not dead throws. */
-    retry(db: DbHandle, jobId: string): Promise<void>;
-    /** Delete a dead job. A job that is not dead throws: deleting a live one would not stop its work. */
-    discard(db: DbHandle, jobId: string): Promise<void>;
+    readonly retention: ResolvedRetention;
+    /**
+     * List jobs: `pending` (the default) is everything not dead, oldest due first; `dead` is what the worker
+     * gave up on, newest first. `state` says where each is now. `limit` 1 to 200, default 100. `next` is the cursor
+     * of the following page (pass it as `after`), null on the last. `effect` filters effect rows, `job` queue rows.
+     */
+    jobs: JobOps['jobs'];
+    /** One job with its event header, its attempts (`attemptLog`) and the latest operations that touched it. */
+    job: JobOps['job'];
+    /** Per effect and queue job name: how many jobs are ready, delayed, running and dead. */
+    jobCounts: JobOps['jobCounts'];
+    /** Who did what to the jobs, newest first. `jobId` keeps the operations that touched one job. */
+    jobOperations: JobOps['jobOperations'];
+    /** Finished jobs, newest first, with `outcome`, `effect` and `job` filters. */
+    archivedJobs: JobOps['archivedJobs'];
+    /** One finished job with its attempt log, or undefined. */
+    archivedJob: JobOps['archivedJob'];
+    /** How many archive rows there are, how many wait for the sink, and how many are past `keepUntil`. */
+    archiveStatus: JobOps['archiveStatus'];
+    /**
+     * Workflow runs, read and operated on: `runs`, `run`, `counts`, `stranded`, `history`, and the operator verbs
+     * `retryStep`, `resolveStep`, `skipUndo`, `signal`, `cancel` and `checkResult`. The verbs need
+     * `compose({ workflows, workflowMeta })`.
+     */
+    readonly workflows: WorkflowOps<Tx>;
+    /**
+     * The limits the registered workflows hold (`concurrency`), read and changed at runtime: `list`, `get`, and the
+     * operator verbs `override`, `reset`, `pause` and `resume`. The verbs need `compose({ workflows, workflowMeta })`.
+     */
+    readonly limits: LimitOps<Tx>;
+    /** A dead job back to pending: attempts and lease cleared, due now, workers woken. `JOB_NOT_DEAD` otherwise. */
+    retry: JobOps['retry'];
+    /** A dead job leaves the hot table, archived as `discarded`. `JOB_NOT_DEAD` otherwise. */
+    discard: JobOps['discard'];
+    /** A ready or delayed job leaves the hot table, archived as `cancelled`. `JOB_RUNNING` or `JOB_NOT_PENDING` otherwise. */
+    cancel: JobOps['cancel'];
+    /** Retry many dead jobs by ids or by filter, all or none by ids. `operationId` is null when nothing matched. */
+    retryDead: JobOps['retryDead'];
+    /** Dead jobs older than `olderThan` leave the hot table, archived or deleted by the retention policy. */
+    purgeDead: JobOps['purgeDead'];
+    /**
+     * Send unexported archive rows to `retention.archive.sink`, oldest first, up to `limit`. Marks them exported only
+     * after the sink resolved (at-least-once); a throwing sink leaves them and returns `failed: true`. No sink: a no-op.
+     * `op` defaults to the actor `system:retention`.
+     */
+    exportArchive: JobOps['exportArchive'];
+    /**
+     * Delete archive rows past `keep_until` and the oldest beyond any `max`. With a sink, only exported rows go.
+     * `op` defaults to the actor `system:retention`.
+     */
+    pruneArchive: JobOps['pruneArchive'];
+    /**
+     * Delete finished workflow runs past their `keep_until`, with their steps and signals. The events stay. A run is never
+     * pruned while it or an ancestor is unfinished. `op` defaults to the actor `system:retention`.
+     */
+    pruneWorkflows: JobOps['pruneWorkflows'];
+    /** Delete operation rows past the `operations` keep. Writes no operation row of its own. */
+    pruneOperations: JobOps['pruneOperations'];
+    /** A new job from an archived one. Not a retry: it gets a new id. `JOB_EXISTS` when a live job holds the dedupe key. Not `replay`, which rebuilds an entity from its events. */
+    replayJob: JobOps['replayJob'];
     /**
      * The one way to extend a run from outside: a wrapper that receives the context and
      * `next`. Command hooks run inside the transaction, around the handler; effect hooks run
@@ -298,11 +459,13 @@ export type Journal<Meta extends z.ZodObject, Tx extends TransactionSource<Tx> =
      * it to stop; a rejection of `next` is the hook's rejection too; the context is frozen
      * and the result cannot be changed; hooks run in registration order, the first outermost.
      * Register at boot: once the journal has run a command, a drain or a worker, `around`
-     * throws `BAD_DEFINITION`.
+     * throws `BAD_DEFINITION`. Step hooks wrap each workflow step body and undo, inside the
+     * `journal.step` span; they are frozen by the first drain or worker.
      */
     readonly hooks: {
-        readonly command: HookPoint<CommandHookContext<z.output<Meta>>>;
-        readonly effect: HookPoint<EffectHookContext<z.output<Meta>>>;
+        readonly command: HookPoint<CommandHookContext<SchemaOutput<Meta>>>;
+        readonly effect: HookPoint<EffectHookContext<SchemaOutput<Meta>>>;
+        readonly step: HookPoint<StepHookContext>;
     };
     readonly catalog: {
         /**
@@ -315,45 +478,102 @@ export type Journal<Meta extends z.ZodObject, Tx extends TransactionSource<Tx> =
         readonly taps: readonly string[];
     };
 };
-export type JournalDefinitions<Meta extends z.ZodObject, Tx extends TransactionSource<Tx> = DbHandle, AppDb extends RootDb = RootDb> = {
-    event<T extends string, S extends z.ZodType, const U extends readonly z.ZodType[] = readonly []>(type: T, schema: S, opts?: EventOptions<S, U>): EventDef<T, S>;
-    /** The key column is `id`. */
-    entity<K extends string, Tbl extends IdTable>(kind: K, table: Tbl): EntityBuilder<K, Tbl, never, z.output<Meta>, 'id'>;
+export type JournalDefinitions<Meta extends StandardSchemaV1<unknown, Record<string, unknown>>, Tx extends TransactionSource<Tx> = DbHandle, AppDb extends RootDb = RootDb> = {
+    /**
+     * An event. `schema` and each upcaster's `from` are Standard Schemas, parsed sync
+     * (`parse`) by the constructor, `write` and replay.
+     */
+    event<T extends string, S extends StandardSchemaV1, const U extends readonly StandardSchemaV1[] = readonly []>(type: T, schema: S, opts?: EventOptions<S, U>): EventDef<T, S>;
+    /**
+     * The key column is `id`. `options.events` says whether this entity's events are stored
+     * (`'stored'`) or only passed through the write (`'transient'`); it overrides the journal's
+     * `events` default. A transient entity has no history: replay, verify, repair, forget, rerun,
+     * adopt, async projections and taps are refused for it.
+     */
+    entity<K extends string, Tbl extends IdTable>(kind: K, table: Tbl, options?: {
+        readonly events?: EventStorage;
+    }): EntityBuilder<K, Tbl, never, SchemaOutput<Meta>, 'id'>;
     /**
      * The key column is the one `table` holds under the property name `options.key`:
      * a non-null string column that is the primary key or unique.
      */
     entity<K extends string, Tbl extends EntityTable, Key extends KeyName<Tbl>>(kind: K, table: Tbl, options: {
         readonly key: Key & SingleKey<Key>;
-    }): EntityBuilder<K, Tbl, never, z.output<Meta>, Key>;
+        readonly events?: EventStorage;
+    }): EntityBuilder<K, Tbl, never, SchemaOutput<Meta>, Key>;
     /**
-     * A command: `input` is parsed before the handler runs; the handler's
+     * A command: `input` (any Standard Schema) is parsed async (`parseAsync`) before
+     * the handler runs, like the command's `meta`; the handler's
      * `write` and `run` are bound to one transaction and one parsed `meta`.
+     * `options.writes` lists the events the handler writes, and `write` takes nothing else.
+     * `options.output` is what a workflow's command node stores of the result.
      * Needs only `j`, entities and events, never the finished journal.
      */
-    command<S extends z.ZodType, R>(name: string, input: S, handler: (input: z.output<S>, context: CommandContext<z.output<Meta>, Tx>) => R, options?: CommandOptions<z.output<S>, z.output<Meta>, Tx>): Command<S, R, z.output<Meta>, Tx>;
+    command<S extends StandardSchemaV1, R, const Writes extends readonly AnyEventDef[], Refused extends void | undefined | Failure = void, Output extends StandardSchemaV1<unknown, Resolved<R>> | undefined = undefined>(name: string, input: S, options: CommandOptions<SchemaOutput<S>, SchemaOutput<Meta>, Tx, Refused, Writes, Output>, handler: (input: SchemaOutput<S>, context: CommandContext<SchemaOutput<Meta>, Tx, Writes[number]>) => R): Command<S, R | Extract<Refused, Failure>, SchemaOutput<Meta>, Tx, Writes, Output>;
     /** `on` is `NoInfer` so `E` comes from `entity`; handlers are then contextually typed. */
-    projection<E extends AnyEntity<z.output<Meta>>>(name: string, entity: E | readonly E[], on: NoInfer<ProjectionHandlers<E, z.output<Meta>, Tx>>, opts?: ProjectionOptions): Projection<z.output<Meta>, Tx>;
-    effect<E extends AnyEntity<z.output<Meta>>>(name: string, entity: E | readonly E[], on: NoInfer<EffectHandlers<E, z.output<Meta>, AppDb, RootCommandRunner<Meta, Tx>>>): Effect<z.output<Meta>, AppDb, RootCommandRunner<Meta, Tx>>;
+    projection<E extends AnyEntity<SchemaOutput<Meta>>>(name: string, entity: E | readonly E[], on: NoInfer<ProjectionHandlers<E, SchemaOutput<Meta>, Tx>>, opts?: ProjectionOptions): Projection<SchemaOutput<Meta>, Tx>;
+    effect<E extends AnyEntity<SchemaOutput<Meta>>>(name: string, entity: E | readonly E[], on: NoInfer<EffectHandlers<E, SchemaOutput<Meta>, AppDb>>): Effect<SchemaOutput<Meta>, AppDb>;
     /**
      * An effect that needs a service: `needs` is `{ mailer: need<Mailer>() }`, and each
-     * handler then gets `mailer` in its context, next to `jobId`, `signal`, `db` and `run`.
+     * handler then gets `mailer` in its context, next to `jobId`, `attempt`, `signal` and `db`.
+     * An effect has no `run`: a command that follows an event is a `j.task` or a `j.workflow` with `startOn`.
      */
-    effect<E extends AnyEntity<z.output<Meta>>, N extends Needs>(name: string, entity: E | readonly E[], needs: N, on: NoInfer<EffectHandlers<E, z.output<Meta>, AppDb, RootCommandRunner<Meta, Tx>, N>>): Effect<z.output<Meta>, AppDb, RootCommandRunner<Meta, Tx>, N>;
+    effect<E extends AnyEntity<SchemaOutput<Meta>>, N extends Needs>(name: string, entity: E | readonly E[], needs: N, on: NoInfer<EffectHandlers<E, SchemaOutput<Meta>, AppDb, N>>): Effect<SchemaOutput<Meta>, AppDb, N>;
     /**
-     * Build the runtime journal from the tables and the handlers. `services` holds one
+     * Build the runtime journal from the tables given to `initJournal` and the handlers. `services` holds one
      * value for every need of every listed effect, by name. A need without a value throws here, unless `services` is `'worker'`.
      * `const`: the list is read as a tuple, so an effect with needs keeps them next to one without.
      */
     /** A tap: in-process, after commit, lossy. See `Tap`. Same shapes as `effect`. */
-    tap<E extends AnyEntity<z.output<Meta>>>(name: string, entity: E | readonly E[], on: NoInfer<TapHandlers<E, z.output<Meta>, AppDb>>): Tap<z.output<Meta>, AppDb>;
-    tap<E extends AnyEntity<z.output<Meta>>, N extends Needs>(name: string, entity: E | readonly E[], needs: N, on: NoInfer<TapHandlers<E, z.output<Meta>, AppDb, N>>): Tap<z.output<Meta>, AppDb, N>;
-    compose<const E extends readonly Effect<z.output<Meta>, AppDb, RootCommandRunner<Meta, Tx>, Needs>[] = readonly [], const T extends readonly Tap<z.output<Meta>, AppDb, Needs>[] = readonly []>(config: {
-        readonly tables: JournalTables;
-        readonly projections?: readonly Projection<z.output<Meta>, Tx>[];
+    tap<E extends AnyEntity<SchemaOutput<Meta>>>(name: string, entity: E | readonly E[], on: NoInfer<TapHandlers<E, SchemaOutput<Meta>, AppDb>>): Tap<SchemaOutput<Meta>, AppDb>;
+    tap<E extends AnyEntity<SchemaOutput<Meta>>, N extends Needs>(name: string, entity: E | readonly E[], needs: N, on: NoInfer<TapHandlers<E, SchemaOutput<Meta>, AppDb, N>>): Tap<SchemaOutput<Meta>, AppDb, N>;
+    /**
+     * A limit several workflows share: list it in each one's `concurrency.shared`. `total` caps the unfinished runs that
+     * hold it, `perKey` those with one concurrency key; at least one, each a positive whole number. Throws
+     * `BAD_DEFINITION` otherwise, and for a name that starts with `workflow/` (a workflow's own limit).
+     */
+    limit(def: LimitDef): LimitDef;
+    /**
+     * A durable workflow: `.step(...)` nodes, then `.finish()`. The finished definition has `start`, a command:
+     * `context.run(refund.start, { input, id? })` returns `{ runId }` (a repeat with the same `id` and input returns the
+     * same run; another input is a `CommandConflict`). Pass the definition to `compose({ workflows })` so a worker runs it.
+     */
+    workflow<Input extends StandardSchemaV1, N extends Needs = NoNeeds, Declared extends StandardSchemaV1 | undefined = undefined, E extends AnyEntity<SchemaOutput<Meta>> = never, D extends EventsOf<E> = never, Timing extends StartTiming = 'after-commit'>(name: string, options: WorkflowOptions<Input, N, Declared, StartOn<Input, E, D, SchemaOutput<Meta>, Timing>, WorkflowHost<Meta, Tx, AppDb>>): WorkflowBuilder<Input, NoResults, N, Declared, never, WorkflowHost<Meta, Tx, AppDb>, StarterOf<Meta, Tx, Input>>;
+    /**
+     * A task: a workflow of one step, for the common case. `j.task(name, options, run)` is
+     * `j.workflow(name, options).step('run', run, { retry, timeout, undo, key }).finish()`, so it is a workflow
+     * definition in every way. The output is what `run` returns; with an `output` schema, `run` must return its output.
+     */
+    task<Input extends StandardSchemaV1, Returned extends FinishBound<Declared>, N extends Needs = NoNeeds, Declared extends StandardSchemaV1 | undefined = undefined, E extends AnyEntity<SchemaOutput<Meta>> = never, D extends EventsOf<E> = never, Timing extends StartTiming = 'after-commit'>(name: string, options: TaskOptions<Input, N, Declared, StartOn<Input, E, D, SchemaOutput<Meta>, Timing>, WorkflowHost<Meta, Tx, AppDb>, Returned>, run: TaskBody<Input, N, WorkflowHost<Meta, Tx, AppDb>, Returned>): TaskDef<Input, N, Declared, StarterOf<Meta, Tx, Input>, Returned>;
+    compose<const E extends readonly Effect<SchemaOutput<Meta>, AppDb, Needs>[] = readonly [], const T extends readonly Tap<SchemaOutput<Meta>, AppDb, Needs>[] = readonly [], const W extends readonly WorkflowDef[] = readonly []>(config: {
+        readonly projections?: readonly Projection<SchemaOutput<Meta>, Tx>[];
         readonly effects?: E;
         readonly taps?: T;
-    } & ServicesOption<ServicesFor<E> & ServicesFor<T>>): Journal<Meta, Tx, AppDb>;
+        /** Workflows to run. Adds the `workflow.step` effect and the `workflow-steps` projection; their needs come from `services`. */
+        readonly workflows?: W;
+        /** The meta recorded on the checkpoints the workflow runner commits, such as `{ actorId: 'system:workflow' }`. Required with `workflows`. */
+        readonly workflowMeta?: SchemaInput<Meta>;
+    } & ServicesOption<ServicesFor<E> & ServicesFor<T> & WorkflowServices<W>>): Journal<Meta, Tx, AppDb>;
+};
+/**
+ * `journal.limits`: what limits there are and the operator verbs that change them. Each verb writes one event on the
+ * `journal.limit` entity, which carries `op.actor`, `op.reason` and `op.executionId`, and returns the limit after it.
+ * An unknown name is `CommandNotFound`.
+ */
+export type LimitOps<Tx> = {
+    /** Every limit the registered workflows hold, by name. */
+    list(db: DbHandle): Promise<LimitView[]>;
+    get(db: DbHandle, name: string): Promise<LimitView | CommandNotFound>;
+    /**
+     * Replaces a code value until `reset`, or the `perKey` of one key until it expires. `CommandInvalid` for a value
+     * that cannot apply: any override of a workflow without `concurrency`, or a `perKey` where no start has a key.
+     */
+    override(source: TransactionSource<Tx>, args: LimitOverrideArgs, op: JobOperationInput): Promise<LimitView | CommandNotFound | CommandInvalid | CommandFailure>;
+    /** The code values again: of one key, or without `key` of the whole limit. Its pause stays. */
+    reset(source: TransactionSource<Tx>, args: LimitResetArgs, op: JobOperationInput): Promise<LimitView | CommandNotFound | CommandFailure>;
+    /** A paused limit admits no new run (`WorkflowBusy` with `reason: 'paused'`); the runs that hold it go on. */
+    pause(source: TransactionSource<Tx>, args: LimitNameArgs, op: JobOperationInput): Promise<LimitView | CommandNotFound | CommandFailure>;
+    resume(source: TransactionSource<Tx>, args: LimitNameArgs, op: JobOperationInput): Promise<LimitView | CommandNotFound | CommandFailure>;
 };
 /**
  * `services` is required as soon as one listed effect has a need. `'worker'` leaves the needs

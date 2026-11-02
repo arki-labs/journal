@@ -1,42 +1,23 @@
 /**
- * The entity row and stored values: load and save the row, exact-id checks, value
- * comparison, the JSON round-trip check, freezing, and the root-database guard.
+ * Stored values: exact-id checks, value comparison, the JSON round-trip check,
+ * freezing, and the root-database guard. Reading and writing rows is `store`'s job.
  * Imports only leaf files (`types`, `errors`). Must not import `journal`, `api`,
  * `write`, `command`, `history` or `worker`.
  */
-import type { z } from 'zod';
-import { eq, getTableColumns, is } from 'drizzle-orm';
+import { getTableColumns, is } from 'drizzle-orm';
 import { PgAsyncTransaction } from 'drizzle-orm/pg-core';
 
-import type {
-  AnyEntity,
-  AnyEventDef,
-  DbHandle,
-  EntityDef,
-  EntityId,
-  EntityTable,
-  ReducerRow,
-  RootDb,
-  Row,
-} from './types.js';
+import type { SchemaFailure } from '@arki/failure';
+import type { StandardSchemaV1 } from '@arki/schema';
+import { InvalidInput, isSchemaFailure } from '@arki/failure';
+import { parse } from '@arki/schema';
+
+import type { AnyEntity, EntityTable, RootDb, Row } from './types.js';
 import { JournalError } from './errors.js';
 
 /** A select row has every column of its table. The check is real; the guard narrows. */
 export function isRowOf<Tbl extends EntityTable>(table: Tbl, value: object): value is Row<Tbl> {
   return Object.keys(getTableColumns(table)).every(column => column in value);
-}
-
-type EntityRowSource = Pick<AnyEntity, 'table' | 'keyColumn'>;
-
-export async function loadRow(
-  db: DbHandle,
-  entity: EntityRowSource,
-  id: string,
-  lock: boolean,
-): Promise<object | null> {
-  const query = db.select().from(entity.table).where(eq(entity.keyColumn, id)).limit(1);
-  const rows = lock ? await query.for('update') : await query;
-  return rows[0] ?? null;
 }
 
 /**
@@ -88,30 +69,6 @@ export function assertStoredId(entity: Pick<AnyEntity, 'kind' | 'key'>, row: obj
       `the stored key is ${JSON.stringify(stored)} but the id given is ${JSON.stringify(id)}; use the stored form`,
     );
   }
-}
-
-/** Insert, update or delete the row so it matches `next`. Returns the stored row. */
-export async function saveReplayed<Tbl extends EntityTable, Key extends string>(
-  db: DbHandle,
-  entity: EntityDef<string, Tbl, AnyEventDef, unknown, Key>,
-  id: EntityId<Tbl, Key>,
-  current: object | null,
-  next: ReducerRow<Tbl, Key> | null,
-): Promise<Row<Tbl> | null> {
-  const erased: EntityTable = entity.table;
-  if (next === null) {
-    if (current !== null) await db.delete(erased).where(eq(entity.keyColumn, id));
-    return null;
-  }
-  const saved =
-    current === null
-      ? await db.insert(erased).values(next).returning()
-      : await db.update(erased).set(next).where(eq(entity.keyColumn, id)).returning();
-  const row = saved[0];
-  if (row === undefined || !isRowOf(entity.table, row)) {
-    throw new Error(`journal: saving ${id} returned no complete row`);
-  }
-  return row;
 }
 
 export function toRecord(value: object): Record<string, unknown> {
@@ -169,7 +126,7 @@ function sameKeys(
 }
 
 /** An object literal shape: prototype `Object.prototype` or `null`. A `Set`, `Map`, `Date` or class instance is not one. */
-function isPlainObject(value: unknown): value is Record<string, unknown> {
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== 'object' || value === null) return false;
   const proto: unknown = Object.getPrototypeOf(value);
   return proto === Object.prototype || proto === null;
@@ -242,24 +199,43 @@ function sameJson(a: unknown, b: unknown): boolean {
 }
 
 /**
+ * Sync parse that reports bad data instead of throwing it: replay and the round-trip
+ * check branch on the result. Invalid input carries issues; async schemas and validator
+ * defects remain canonical schema failures for the caller to propagate.
+ */
+export function safeParse<Output>(
+  schema: StandardSchemaV1<unknown, Output>,
+  value: unknown,
+): { readonly success: true; readonly data: Output } | { readonly success: false; readonly error: SchemaFailure } {
+  const parsed = parse(schema, value);
+  return isSchemaFailure(parsed) ? { success: false, error: parsed } : { success: true, data: parsed };
+}
+
+/**
  * Throws `UNSTABLE_SCHEMA` unless the value survives JSON storage and a second parse
  * unchanged. Replay depends on this. A value JSON cannot encode (a `bigint`, a cycle)
  * is the same failure, with the serializer's error as `cause`.
  */
-export function assertRoundTrips(schema: z.ZodType, value: unknown, kind: string, id: string, what: string): void {
-  let stable: boolean;
+export function assertRoundTrips(
+  schema: StandardSchemaV1,
+  value: unknown,
+  kind: string,
+  id: string,
+  what: string,
+): void | SchemaFailure {
+  let stored: unknown;
   try {
     // Not structuredClone: the point is what JSON storage does to the value (Dates become strings).
     const text = JSON.stringify(value);
-    const stored: unknown = JSON.parse(text);
-    const again = schema.safeParse(stored);
-    stable = again.success && sameJson(again.data, value);
+    stored = JSON.parse(text);
   } catch (error) {
     throw new JournalError('UNSTABLE_SCHEMA', kind, id, `${what}: the value cannot be stored as JSON`, {
       cause: error,
     });
   }
-  if (!stable)
+  const again = safeParse(schema, stored);
+  if (!again.success && !InvalidInput.is(again.error)) return again.error;
+  if (!(again.success && sameJson(again.data, value)))
     throw new JournalError(
       'UNSTABLE_SCHEMA',
       kind,

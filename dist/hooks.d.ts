@@ -5,7 +5,7 @@ export type HookPoint<Ctx> = {
     /** Wrap every run. Throws `BAD_DEFINITION` once the journal has run a command, a drain or a worker. */
     around(hook: Around<Ctx>): void;
 };
-export declare function createHookPoint<Ctx extends object>(what: 'command' | 'effect'): {
+export declare function createHookPoint<Ctx extends object>(what: 'command' | 'effect' | 'step'): {
     point: HookPoint<Ctx>;
     freeze: () => void;
     run: <T>(ctx: Ctx, work: () => Promise<T>) => Promise<T>;

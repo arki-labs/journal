@@ -1,8 +1,13 @@
-export declare const eventId: () => `evt_${string}`;
-export declare const jobId: () => `job_${string}`;
-export declare const commandId: () => `cmd_${string}`;
-export declare const correlationId: () => `cor_${string}`;
-export declare const leaseToken: () => string;
+export declare const eventId: () => `evt_${string}` | import("@arki/contracts").IdGenerationFailure;
+export declare const jobId: () => `job_${string}` | import("@arki/contracts").IdGenerationFailure;
+export declare const commandId: () => `cmd_${string}` | import("@arki/contracts").IdGenerationFailure;
+export declare const correlationId: () => `cor_${string}` | import("@arki/contracts").IdGenerationFailure;
+export declare const attemptId: () => `att_${string}` | import("@arki/contracts").IdGenerationFailure;
+export declare const operationId: () => `jop_${string}` | import("@arki/contracts").IdGenerationFailure;
+export declare const workflowRunId: () => `wfr_${string}` | import("@arki/contracts").IdGenerationFailure;
+export declare const workflowBatchId: () => `wfb_${string}` | import("@arki/contracts").IdGenerationFailure;
+export declare const workflowSignalId: () => `wsg_${string}` | import("@arki/contracts").IdGenerationFailure;
+export declare const leaseToken: () => string | import("@arki/contracts").IdGenerationFailure;
 declare const NAME_KINDS: {
     readonly 'entity kind': 64;
     readonly 'event type': 128;

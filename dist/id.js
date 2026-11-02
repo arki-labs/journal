@@ -1,16 +1,15 @@
-import { createId } from '@paralleldrive/cuid2';
+import { defineId } from '@arki/contracts';
 import { JournalError } from './errors.js';
-/**
- * Same shape as `createPrefixedId` in `@arki/db/id`. That module is not
- * imported because its value export pulls `drizzle-orm/pg-core` and
- * `@arki/contracts` into browser bundles.
- */
-const prefixed = (prefix) => `${prefix}${createId()}`;
-export const eventId = () => prefixed('evt_');
-export const jobId = () => prefixed('job_');
-export const commandId = () => prefixed('cmd_');
-export const correlationId = () => prefixed('cor_');
-export const leaseToken = () => createId();
+export const eventId = defineId('evt_').create;
+export const jobId = defineId('job_').create;
+export const commandId = defineId('cmd_').create;
+export const correlationId = defineId('cor_').create;
+export const attemptId = defineId('att_').create;
+export const operationId = defineId('jop_').create;
+export const workflowRunId = defineId('wfr_').create;
+export const workflowBatchId = defineId('wfb_').create;
+export const workflowSignalId = defineId('wsg_').create;
+export const leaseToken = defineId('').create;
 const NAME_KINDS = {
     'entity kind': 64,
     'event type': 128,

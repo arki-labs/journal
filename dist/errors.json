@@ -1,0 +1,299 @@
+[
+  {
+    "code": "ARKI_JOURNAL_E001",
+    "package": "@arki/journal",
+    "kind": "thrown",
+    "what": "The job (or the set of jobs) changed since the preview the approval pinned. HTTP 409.",
+    "fix": "Refresh the job preview and obtain approval for its current revision before executing.",
+    "verify": "bun run test -- src/foreman/index.test.ts",
+    "source": "src/foreman/shapes.ts:21"
+  },
+  {
+    "code": "ARKI_JOURNAL_E002",
+    "package": "@arki/journal",
+    "kind": "thrown",
+    "what": "The action needs a dead job and the job is not dead, or is gone. HTTP 409.",
+    "fix": "Select an existing dead job; refresh its state before retrying or discarding it.",
+    "verify": "bun run test -- src/foreman/index.test.ts",
+    "source": "src/foreman/shapes.ts:26"
+  },
+  {
+    "code": "ARKI_JOURNAL_E003",
+    "package": "@arki/journal",
+    "kind": "thrown",
+    "what": "The purge bound is shorter than `journal.retention.retryableFor`. HTTP 400.",
+    "fix": "Set the purge age at least as long as journal.retention.retryableFor.",
+    "verify": "bun run test -- src/foreman/index.test.ts",
+    "source": "src/foreman/shapes.ts:31"
+  },
+  {
+    "code": "ARKI_JOURNAL_E004",
+    "package": "@arki/journal",
+    "kind": "thrown",
+    "what": "Cancel needs a ready or delayed job and the job is running, dead or gone. HTTP 409.",
+    "fix": "Cancel only a ready or delayed job; refresh the job state first.",
+    "verify": "bun run test -- src/foreman/index.test.ts",
+    "source": "src/foreman/shapes.ts:36"
+  },
+  {
+    "code": "ARKI_JOURNAL_E005",
+    "package": "@arki/journal",
+    "kind": "thrown",
+    "what": "Replay is blocked by an unfinished job that holds the same dedupe key. HTTP 409.",
+    "fix": "Wait for or reconcile the unfinished job holding the dedupe key before replaying.",
+    "verify": "bun run test -- src/foreman/index.test.ts",
+    "source": "src/foreman/shapes.ts:41"
+  },
+  {
+    "code": "ARKI_JOURNAL_E006",
+    "package": "@arki/journal",
+    "kind": "thrown",
+    "what": "The job belongs to a workflow run, so the raw job actions refuse it. HTTP 409.",
+    "fix": "Use the workflow operations for this job instead of raw job actions.",
+    "verify": "bun run test -- src/foreman/index.test.ts",
+    "source": "src/foreman/shapes.ts:46"
+  },
+  {
+    "code": "ARKI_JOURNAL_E010",
+    "package": "@arki/journal",
+    "kind": "thrown",
+    "what": "The run changed since the preview the approval pinned. HTTP 409.",
+    "fix": "Refresh the workflow preview and obtain approval for the current run revision.",
+    "verify": "bun run test -- src/foreman/workflows.test.ts",
+    "source": "src/foreman/shapes.ts:58"
+  },
+  {
+    "code": "ARKI_JOURNAL_E011",
+    "package": "@arki/journal",
+    "kind": "thrown",
+    "what": "The run is over: completed, failed or cancelled. HTTP 409.",
+    "fix": "Inspect the terminal run result; start a new run instead of mutating the finished run.",
+    "verify": "bun run test -- src/foreman/workflows.test.ts",
+    "source": "src/foreman/shapes.ts:63"
+  },
+  {
+    "code": "ARKI_JOURNAL_E012",
+    "package": "@arki/journal",
+    "kind": "thrown",
+    "what": "The step is not dead (or never ran), so there is nothing to retry, resolve or skip. HTTP 409.",
+    "fix": "Select a dead step and refresh the run before retrying, resolving or skipping it.",
+    "verify": "bun run test -- src/foreman/workflows.test.ts",
+    "source": "src/foreman/shapes.ts:68"
+  },
+  {
+    "code": "ARKI_JOURNAL_E013",
+    "package": "@arki/journal",
+    "kind": "thrown",
+    "what": "The signal name is unknown to the run's version, or its payload does not match the signal's schema. HTTP 400.",
+    "fix": "Use a signal declared by the pinned workflow version and supply a payload matching its schema.",
+    "verify": "bun run test -- src/foreman/workflows.test.ts",
+    "source": "src/foreman/shapes.ts:73"
+  },
+  {
+    "code": "ARKI_JOURNAL_E014",
+    "package": "@arki/journal",
+    "kind": "thrown",
+    "what": "The run is already undoing its work. HTTP 409.",
+    "fix": "Let compensation finish and inspect its outcome before further workflow operations.",
+    "verify": "bun run test -- src/foreman/workflows.test.ts",
+    "source": "src/foreman/shapes.ts:78"
+  },
+  {
+    "code": "ARKI_JOURNAL_E015",
+    "package": "@arki/journal",
+    "kind": "thrown",
+    "what": "The step cannot be resolved by hand: no `output` schema, not a step, or the run is not running. 409; 400 for a result that does not match the schema.",
+    "fix": "Resolve a dead step of a running workflow that declares an output schema, using a result accepted by that schema.",
+    "verify": "bun run test -- src/foreman/workflows.test.ts",
+    "source": "src/foreman/shapes.ts:83"
+  },
+  {
+    "code": "ARKI_JOURNAL_E016",
+    "package": "@arki/journal",
+    "kind": "thrown",
+    "what": "No run has this id. HTTP 404.",
+    "fix": "Check the run id against the journal and use an existing run.",
+    "verify": "bun run test -- src/foreman/workflows.test.ts",
+    "source": "src/foreman/shapes.ts:88"
+  },
+  {
+    "code": "ARKI_JOURNAL_E017",
+    "package": "@arki/journal",
+    "kind": "thrown",
+    "what": "The run's code is not registered on this journal, or has other nodes, so nothing can move it. HTTP 409.",
+    "fix": "Restore the workflow definition and version pinned by the run with its original node shape.",
+    "verify": "bun run test -- src/foreman/workflows.test.ts",
+    "source": "src/foreman/shapes.ts:93"
+  },
+  {
+    "code": "ARKI_JOURNAL_PLUGIN_E001",
+    "package": "@arki/journal",
+    "kind": "thrown",
+    "what": "A feature supplied an invalid Journal contribution.",
+    "fix": "Declare a feature's reactions with journalHandlers(core, { effects, taps, workflows }) in .usecases(...), and its projections with journalProjections(...) in .infra(...), both from",
+    "verify": "bun run test -- src/dot-feature.test.ts",
+    "source": "src/dot.ts:95"
+  },
+  {
+    "code": "ARKI_JOURNAL_WEBHOOK_E001",
+    "package": "@arki/journal",
+    "kind": "thrown",
+    "what": "An input failed its schema, a payload is not JSON, or a URL is not public https.",
+    "fix": "Validate the webhook input and JSON payload; use a public HTTPS destination.",
+    "verify": "bun run test -- src/http/webhooks.test.ts",
+    "source": "src/http/webhooks.ts:55"
+  },
+  {
+    "code": "ARKI_JOURNAL_WEBHOOK_E002",
+    "package": "@arki/journal",
+    "kind": "thrown",
+    "what": "`dispatch` got the root database. It needs the business transaction.",
+    "fix": "Dispatch inside the business database transaction and pass its transaction handle.",
+    "verify": "bun run test -- src/http/webhooks.test.ts",
+    "source": "src/http/webhooks.ts:60"
+  },
+  {
+    "code": "ARKI_JOURNAL_WEBHOOK_E003",
+    "package": "@arki/journal",
+    "kind": "thrown",
+    "what": "No subscription or message has this id.",
+    "fix": "Check the subscription or message id and use an existing record.",
+    "verify": "bun run test -- src/http/webhooks.test.ts",
+    "source": "src/http/webhooks.ts:65"
+  },
+  {
+    "code": "ARKI_JOURNAL_WEBHOOK_E004",
+    "package": "@arki/journal",
+    "kind": "thrown",
+    "what": "`replay` named a message and a subscription of different partners.",
+    "fix": "Replay only to a subscription owned by the same partner as the message.",
+    "verify": "bun run test -- src/http/webhooks.test.ts",
+    "source": "src/http/webhooks.ts:70"
+  },
+  {
+    "code": "ARKI_JOURNAL_WEBHOOK_E005",
+    "package": "@arki/journal",
+    "kind": "thrown",
+    "what": "`encryptionKey` is not 32 bytes of base64.",
+    "fix": "Configure encryptionKey as a base64-encoded 32-byte key.",
+    "verify": "bun run test -- src/http/webhooks.test.ts",
+    "source": "src/http/webhooks.ts:75"
+  },
+  {
+    "code": "ARKI_JOURNAL_WEBHOOK_E006",
+    "package": "@arki/journal",
+    "kind": "thrown",
+    "what": "The subscriber answered with a status other than 2xx. The worker retries it.",
+    "fix": "Inspect the subscriber response and restore its successful 2xx handling; let the worker retry delivery.",
+    "verify": "bun run test -- src/http/webhooks.test.ts",
+    "source": "src/http/webhooks.ts:80"
+  },
+  {
+    "code": "journal.conflict",
+    "package": "@arki/journal",
+    "kind": "failure",
+    "what": "The current state does not allow it, such as an order that is already paid. See {@link CommandNotFound}.",
+    "fix": "Refresh the resource state and choose an operation permitted by its current state.",
+    "verify": "bun run test -- src/returned-failure.test.ts",
+    "source": "src/errors.ts:280"
+  },
+  {
+    "code": "journal.forbidden",
+    "package": "@arki/journal",
+    "kind": "failure",
+    "what": "The caller may not do this. See {@link CommandNotFound}.",
+    "fix": "Use a caller authorized for this command; do not retry the same unauthorized request.",
+    "verify": "bun run test -- src/returned-failure.test.ts",
+    "source": "src/errors.ts:267"
+  },
+  {
+    "code": "journal.invalid",
+    "package": "@arki/journal",
+    "kind": "failure",
+    "what": "The request is wrong in a way the input schema cannot see. See {@link CommandNotFound}.",
+    "fix": "Correct the domain request described by the client-facing detail before submitting again.",
+    "verify": "bun run test -- src/returned-failure.test.ts",
+    "source": "src/errors.ts:254"
+  },
+  {
+    "code": "journal.not_found",
+    "package": "@arki/journal",
+    "kind": "failure",
+    "what": "The four failures a command returns when a rule of the app says no. Return one from a command handler, its `authorize`, or the `events` function of a `write`: the command's transaction rolls back, exactly as for a throw, and `journal.run` returns the same failure to the caller. `detail` is the message, written for the client. An app may return its own `defineFailure` values too; any failure rolls the command back.",
+    "fix": "Check the resource identifier and use an existing resource visible to this command.",
+    "verify": "bun run test -- src/returned-failure.test.ts",
+    "source": "src/errors.ts:241"
+  },
+  {
+    "code": "journal.workflow_busy",
+    "package": "@arki/journal",
+    "kind": "failure",
+    "what": "A start found a limit it holds full or paused (`reason`). `limitName` names it: `workflow/<name>` for the workflow's own `concurrency.limit` and `total`, else a `j.limit`. `limit` is the count that is reached (0 for a pause), `key` the start's concurrency key (`null` without one: only a `total` can block such a start). `running` lists the runs of the caller's own scope that hold the limit, oldest first, at most 100; another scope's run ids are never shown. Returned when `onBusy` is `'refuse'`, for a pause, for a full limit other than the workflow's own `perKey`, and always for a child run: a child cannot join a run that another parent started.",
+    "fix": "Wait for one of the running runs to finish, start the run with another concurrency key, or ask an operator to raise or resume the limit (`journal.limits`).",
+    "verify": "bun run test -- src/workflow/concurrency.test.ts",
+    "source": "src/errors.ts:317"
+  },
+  {
+    "code": "journal.workflow_pending",
+    "package": "@arki/journal",
+    "kind": "failure",
+    "what": "`def.settled` or `def.startAndWait` stopped waiting before the run ended. The run goes on: a wait never cancels it. `runId` is the run to read again later (`def.settled`), or to cancel on purpose.",
+    "fix": "Read the run again with def.settled, or take the run id and return to the caller now; do not start the work again.",
+    "verify": "bun run test -- src/workflow/outcomes.test.ts",
+    "source": "src/errors.ts:374"
+  },
+  {
+    "code": "journal.workflow_read_mismatch",
+    "package": "@arki/journal",
+    "kind": "failure",
+    "what": "What `def.read` returns when a stored value of the run does not fit its schema. `field` is `input`, `output` or `results.<node>`; `detail` is the `WORKFLOW_READ_MISMATCH` message, and the cause is the schema's `InvalidInput`, with its issues.",
+    "fix": "Read the run untyped with journal.workflows.run, or let the schema take the values older runs stored.",
+    "verify": "bun run test -- src/workflow/def-read.test.ts",
+    "source": "src/errors.ts:360"
+  },
+  {
+    "code": "journal.workflow_run_cancelled",
+    "package": "@arki/journal",
+    "kind": "failure",
+    "what": "A run that `def.startAndWait` waited for was cancelled. `reason` is the cancel's reason, or `null` when none was recorded.",
+    "fix": "Start the run again if the work is still wanted.",
+    "verify": "bun run test -- src/workflow/outcomes.test.ts",
+    "source": "src/errors.ts:401"
+  },
+  {
+    "code": "journal.workflow_run_failed",
+    "package": "@arki/journal",
+    "kind": "failure",
+    "what": "A run that `def.startAndWait` waited for ended `failed` (or `expired`): a step died, or a node refused. `error` is the text the run recorded.",
+    "fix": "Read the run (def.read) to see which node failed, and retry that step or start the run again.",
+    "verify": "bun run test -- src/workflow/outcomes.test.ts",
+    "source": "src/errors.ts:388"
+  },
+  {
+    "code": "journal.workflow_stranded",
+    "package": "@arki/journal",
+    "kind": "failure",
+    "what": "The pinned workflow code is unavailable or incompatible; keep the run unchanged until an operator restores it.",
+    "fix": "Restore the pinned workflow version and original node shape before resuming the run.",
+    "verify": "bun run test -- src/returned-failure.test.ts",
+    "source": "src/errors.ts:293"
+  },
+  {
+    "code": "journal.workflow_transition_limit",
+    "package": "@arki/journal",
+    "kind": "failure",
+    "what": "A run tried to start a node past its workflow's `limits.transitions`, so it stops: it compensates, then ends `failed` with this failure as its error. `limit` is the workflow's `limits.transitions`; `transitions` is the count the run had reached. A transition is the first try of a node: each visit of a node in a loop counts, and so does a node its `when` skips; a retry and an undo do not.",
+    "fix": "Find why the run loops (a `next` that never leaves the loop), or raise `limits.transitions` when the loop is as long as the work needs.",
+    "verify": "bun run test -- src/workflow/transitions.pg.test.ts",
+    "source": "src/errors.ts:344"
+  },
+  {
+    "code": "journal.workflow.step_dead",
+    "package": "@arki/journal",
+    "kind": "failure",
+    "what": "What a step's last attempt returns to the worker when the step is dead: the job dies at once and an operator can revive it.",
+    "fix": "Inspect the dead step and its private failure, repair the cause, then retry or resolve the step through workflow operations.",
+    "verify": "bun run test -- src/workflow/runner.test.ts",
+    "source": "src/workflow/runner.ts:363"
+  }
+]

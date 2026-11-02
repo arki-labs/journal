@@ -1,4 +1,4 @@
-import type { AnyEventDef, EntityDef, EntityId, EntityTable, Patch, Recorded, RecordedOf, ReducerRow, ReducerValues, Row } from './types.js';
+import type { AnyEventDef, EntityDef, EntityId, EntityTable, EventStorage, Patch, Recorded, RecordedOf, ReducerRow, ReducerValues, Row } from './types.js';
 /**
  * The keys that every `.create` reducer so far returns with a type that
  * excludes `undefined`. `CreateResults` is the union of their return types, so a key
@@ -42,7 +42,11 @@ export type OnOnlyEntityBuilder<Kind extends string, Tbl extends EntityTable, Ev
      */
     on<AddedEvent extends AnyEventDef>(event: AddedEvent, reduce: (row: OnReducerRow<Tbl, Key, CreateResults>, event: RecordedOf<AddedEvent, Meta, EntityId<Tbl, Key>>) => Patch<Tbl, Key> | null): OnOnlyEntityBuilder<Kind, Tbl, EventDefs | AddedEvent, Meta, Key, CreateResults>;
 };
-export declare function defineEntity<Kind extends string, Tbl extends EntityTable, Meta, Key extends string>(kind: Kind, table: Tbl, key: Key): EntityBuilder<Kind, Tbl, never, Meta, Key>;
+/**
+ * Standalone, it cannot see a journal default, so `eventStorage` is `'stored'` unless given.
+ * `journal.entity` resolves the journal's default and passes it here.
+ */
+export declare function defineEntity<Kind extends string, Tbl extends EntityTable, Meta, Key extends string>(kind: Kind, table: Tbl, key: Key, eventStorage?: EventStorage): EntityBuilder<Kind, Tbl, never, Meta, Key>;
 /** The reducer-shaped row: a state plus the key column and `version`. */
 export declare function withEntityIdentity<Tbl extends EntityTable, Key extends string>(entity: EntityDef<string, Tbl, AnyEventDef, unknown, Key>, state: Row<Tbl> | ReducerValues<Tbl, Key>, id: EntityId<Tbl, Key>, version: number): ReducerRow<Tbl, Key>;
 /**

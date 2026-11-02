@@ -1,3 +1,11 @@
+import { z } from 'zod';
+
+import { TRANSACTION_FAILURES } from '@arki/db/contract';
+
+import { defineFailure, SCHEMA_FAILURES } from '@arki/failure';
+
+import { LIMIT_BUSY_REASONS } from './workflow/states.js';
+
 export type JournalErrorCode =
   | 'CONFLICT'
   | 'NO_ROW'
@@ -6,11 +14,33 @@ export type JournalErrorCode =
   | 'VERSION_MISMATCH'
   | 'NO_HISTORY'
   | 'HISTORY_GAP'
+  | 'FORWARD_PENDING'
+  | 'FORWARD_DIVERGED'
   | 'REPLAY_FAILED'
   | 'UNSTABLE_SCHEMA'
   | 'ID_MISMATCH'
   | 'VALUE_MISMATCH'
-  | 'BAD_DEFINITION';
+  | 'IGNORED_FAILURE'
+  | 'INVALID_ACCEPT'
+  | 'BAD_DEFINITION'
+  | 'JOB_NOT_DEAD'
+  | 'JOB_NOT_PENDING'
+  | 'JOB_RUNNING'
+  | 'JOB_EXISTS'
+  | 'JOB_MANAGED'
+  | 'BAD_ARGUMENT'
+  | 'LEASE_LOST'
+  | 'STEP_TIMEOUT'
+  | 'WORKFLOW_LIMIT'
+  | 'WORKFLOW_UNKNOWN'
+  | 'WORKFLOW_SHAPE_CHANGED'
+  | 'WORKFLOW_VERSION_RETIRED'
+  | 'WORKFLOW_NOT_FOUND'
+  | 'WORKFLOW_FINISHED'
+  | 'WORKFLOW_COMPENSATING'
+  | 'STEP_NOT_DEAD'
+  | 'STEP_NOT_RESOLVABLE'
+  | 'WORKFLOW_READ_MISMATCH';
 
 /** Per code: what happened, and what to do next. The throw site adds the detail (event type, version, column). */
 const MESSAGES: Record<JournalErrorCode, { readonly what: string; readonly next: string }> = {
@@ -36,7 +66,15 @@ const MESSAGES: Record<JournalErrorCode, { readonly what: string; readonly next:
   },
   NO_HISTORY: {
     what: 'a complete history that starts at version 1 is not available',
-    next: 'Replay and repair cannot rebuild this row. Check whether the row existed before the journal, or restore the missing events',
+    next: "Replay and repair cannot rebuild this row. Check whether the row existed before the journal, or restore the missing events. An entity declared with events: 'transient' keeps none, and the history verbs never apply to it",
+  },
+  FORWARD_PENDING: {
+    what: 'events of this entity are still on their way to its event log',
+    next: 'A forward job has not appended them yet, so the log is behind the row. Run the worker, or retry a dead forward job, and call again once `forwardLag` shows none for the entity',
+  },
+  FORWARD_DIVERGED: {
+    what: "the event log holds other events at this entity's versions",
+    next: 'Something other than this journal wrote to the log. The forward job is dead and its stream waits. Check what wrote there, then `discard` the job (the log already holds its versions) and `repair` the row from the log, or remove the foreign events',
   },
   HISTORY_GAP: {
     what: 'the log has a hole, or the row is newer than a log that says it is alive',
@@ -58,9 +96,89 @@ const MESSAGES: Record<JournalErrorCode, { readonly what: string; readonly next:
     what: 'the database stored a different value than the reducer produced',
     next: 'The write was rolled back. Make the reducer produce the value in the form the column stores',
   },
+  IGNORED_FAILURE: {
+    what: 'a write or a child command returned a failure, and the command still returned a success',
+    next: 'Return that failure from the handler, or another one: `if (isFailure(result)) return result;`. A command that met a failure must end with one, so none of its writes commit. To handle the refusal on purpose and still succeed, check it and call `accept(result)` first',
+  },
+  INVALID_ACCEPT: {
+    what: '`accept` cannot mark this value as a handled refusal',
+    next: 'Call `accept(result)` with the very failure a `write` or `run` of this handler returned, once for each return, before the handler returns',
+  },
   BAD_DEFINITION: {
     what: 'a declaration is wrong',
-    next: 'Fix the declaration named in the detail. It is thrown when the module that declares it loads, so no data was touched',
+    next: 'Fix the declaration named in the detail. It is thrown when the module that declares it loads, or by the run of a command that writes an event outside its `writes` list, and either way no data was kept',
+  },
+  JOB_NOT_DEAD: {
+    what: 'the job is not dead',
+    next: 'Only a job that ran out of attempts can be retried or discarded. Look the job up first',
+  },
+  JOB_NOT_PENDING: {
+    what: 'the job is not waiting to run',
+    next: 'Only a job that has not run out of attempts can be cancelled. Look the job up first',
+  },
+  JOB_RUNNING: {
+    what: 'a worker holds the job right now',
+    next: 'Wait for it to finish, or for its lease to expire, then try again',
+  },
+  JOB_MANAGED: {
+    what: 'a workflow run owns this job',
+    next: "A step or timer of a workflow run is moved by the workflow's own actions, not by the raw job verbs. Use the workflow's actions",
+  },
+  JOB_EXISTS: {
+    what: 'an unfinished job already holds this dedupe key',
+    next: 'Wait for that job to finish, or cancel it, then try again',
+  },
+  BAD_ARGUMENT: {
+    what: 'an argument is out of range',
+    next: 'Fix the argument named in the detail, then call again',
+  },
+  LEASE_LOST: {
+    what: 'this worker no longer holds the job: its lease ran out and another worker took it, or the job was finished or removed',
+    next: 'Nothing was written. Stop the handler. The new owner runs the job, so a side effect outside the database needs an idempotency key',
+  },
+  STEP_TIMEOUT: {
+    what: 'a workflow step ran longer than its timeout',
+    next: 'The step failed and follows its retry. Raise the step `timeout`, or make the body stop when `ctx.signal` aborts',
+  },
+  WORKFLOW_LIMIT: {
+    what: 'a workflow value is larger than `limits.payload`',
+    next: 'Keep the input or the step result small: store the data elsewhere and return a reference, or raise `limits.payload`',
+  },
+  WORKFLOW_UNKNOWN: {
+    what: 'no registered workflow has this name and version',
+    next: 'Pass the workflow to `compose({ workflows })` in every process that starts or runs it, and keep the old version registered until its runs finish',
+  },
+  WORKFLOW_SHAPE_CHANGED: {
+    what: 'the registered workflow has other nodes than the run was started with',
+    next: 'A run keeps the shape it started with. Bump the workflow `version` for a changed shape, and keep the old version registered until its runs finish',
+  },
+  WORKFLOW_VERSION_RETIRED: {
+    what: 'a newer version of this workflow is registered, so this version no longer starts runs',
+    next: 'Start the run with the newest version. The older version stays registered only to finish the runs it already has',
+  },
+  WORKFLOW_NOT_FOUND: {
+    what: 'no workflow run has this id',
+    next: 'Check the run id, and that the run was not pruned after it finished',
+  },
+  WORKFLOW_FINISHED: {
+    what: 'the workflow run is finished, so nothing can move it',
+    next: 'A completed, failed or cancelled run is history. Start a new run to do the work again',
+  },
+  WORKFLOW_COMPENSATING: {
+    what: 'the workflow run is undoing its work, so this action does not apply',
+    next: 'Wait for compensation to end, or fix the failed undo (`retryStep` or `skipUndo`)',
+  },
+  STEP_NOT_DEAD: {
+    what: 'this step is not dead, so there is nothing to retry or skip',
+    next: 'Only a failed step, or a step whose job died because the run is stranded, can be moved by an operator. Read the run to see the step status',
+  },
+  STEP_NOT_RESOLVABLE: {
+    what: 'an operator cannot supply the result of this step',
+    next: 'Only a failed `do` step of a running run that declares an `output` schema can be resolved. Use `retryStep` instead',
+  },
+  WORKFLOW_READ_MISMATCH: {
+    what: 'a stored value of this workflow run does not fit its schema, so `def.read` cannot give it typed',
+    next: 'Read the run untyped with `journal.workflows.run`. A run started on an older version, or an input schema that transforms its value, can store values the schema no longer takes',
   },
 };
 
@@ -70,13 +188,20 @@ const MESSAGES: Record<JournalErrorCode, { readonly what: string; readonly next:
  *
  * Not every error the journal lets out is a `JournalError`:
  * - A wrong definition is a `JournalError` with code `BAD_DEFINITION`, thrown when the
- *   declaration runs (a bad name, a bad key column, a duplicate reducer or handler name).
+ *   declaration runs (a bad name, a bad key column, a duplicate reducer or handler name),
+ *   or when a command writes an event its `writes` list does not declare.
  * - A misuse at run time is a plain `Error` whose message starts with `journal:` (two
  *   operations at once on one transaction, `drain` inside a transaction).
- * - Command input, event data or `meta` that fails its schema is a `ZodError`.
+ * - A misused `accept` (a value the handler never received, accepted twice, called late,
+ *   or not a failure) is a `JournalError` with code `INVALID_ACCEPT`.
+ * - Command input, event data or `meta` that fails its schema returns `InvalidInput`
+ *   from `@arki/failure`, with `data.issues`. An async schema in a sync call returns
+ *   `AsyncSchema`; a throwing validator returns `ValidatorDefect`.
  * - An error thrown by a command handler, an `events` function, a reducer or a
- *   projection passes through unchanged. A rejected business rule is one of
- *   these: a `CommandError`, below.
+ *   projection is normalized by command transaction ownership to `TransactionDefect` with a private cause.
+ *   Direct low-level operations keep their documented exception contract. A rejected business rule is not thrown:
+ *   it is returned as a failure (`CommandNotFound` and the others below), and
+ *   `journal.run` returns it.
  * An error thrown by an effect is caught by `drain` and stored on the job.
  */
 export class JournalError extends Error {
@@ -101,34 +226,187 @@ export function isJournalError(error: unknown, code?: JournalErrorCode): error i
   return error instanceof JournalError && (code === undefined || error.code === code);
 }
 
-/** The kind of answer a rejected request gets. The names are the usual HTTP ones: 404, 400, 403, 409. */
-export type CommandErrorCode = 'NOT_FOUND' | 'BAD_REQUEST' | 'FORBIDDEN' | 'CONFLICT';
+/** What every command failure carries: the message, written for the client. */
+const CommandRefusal = z.object({ detail: z.string() });
 
 /**
- * A business rule rejected the request. App code throws it: a command handler,
- * or the `events` function of a `write`. The code names the kind of answer and
- * the message is written for the client.
- *
- * It is NOT a `JournalError`. A `JournalError` is the library's own failure: a
- * row or a history it refuses. A `CommandError` is the app's rule saying no.
- * The library never throws one and never changes one: like every error thrown
- * by app code, it leaves `journal.run` as the same instance, after the
- * command's transaction rolled back.
- *
- * Nothing here knows HTTP. The host maps the code to its own transport:
- * `@arki/journal/orpc` does it for oRPC, and any other host matches on the
- * code with `isCommandError`.
+ * The four failures a command returns when a rule of the app says no. Return one from a
+ * command handler, its `authorize`, or the `events` function of a `write`: the command's
+ * transaction rolls back, exactly as for a throw, and `journal.run` returns the same
+ * failure to the caller. `detail` is the message, written for the client. An app may
+ * return its own `defineFailure` values too; any failure rolls the command back.
+ * @fix Check the resource identifier and use an existing resource visible to this command.
+ * @verify bun run test -- src/returned-failure.test.ts
  */
-export class CommandError extends Error {
-  readonly code: CommandErrorCode;
+export const CommandNotFound = defineFailure('journal.not_found', {
+  status: 404,
+  data: CommandRefusal,
+  message: '{detail}',
+  remediation: 'Check the resource identifier and use an existing resource visible to this command.',
+});
+/** A {@link CommandNotFound} failure value. */
+export type CommandNotFound = ReturnType<typeof CommandNotFound>;
 
-  constructor(code: CommandErrorCode, message: string) {
-    super(message);
-    this.name = 'CommandError';
-    this.code = code;
-  }
-}
+/** The request is wrong in a way the input schema cannot see. See {@link CommandNotFound}.
+ * @fix Correct the domain request described by the client-facing detail before submitting again.
+ * @verify bun run test -- src/returned-failure.test.ts
+ */
+export const CommandInvalid = defineFailure('journal.invalid', {
+  status: 400,
+  data: CommandRefusal,
+  message: '{detail}',
+  remediation: 'Correct the domain request described by the client-facing detail before submitting again.',
+});
+/** A {@link CommandInvalid} failure value. */
+export type CommandInvalid = ReturnType<typeof CommandInvalid>;
 
-export function isCommandError(error: unknown, code?: CommandErrorCode): error is CommandError {
-  return error instanceof CommandError && (code === undefined || error.code === code);
-}
+/** The caller may not do this. See {@link CommandNotFound}.
+ * @fix Use a caller authorized for this command; do not retry the same unauthorized request.
+ * @verify bun run test -- src/returned-failure.test.ts
+ */
+export const CommandForbidden = defineFailure('journal.forbidden', {
+  status: 403,
+  data: CommandRefusal,
+  message: '{detail}',
+  remediation: 'Use a caller authorized for this command; do not retry the same unauthorized request.',
+});
+/** A {@link CommandForbidden} failure value. */
+export type CommandForbidden = ReturnType<typeof CommandForbidden>;
+
+/** The current state does not allow it, such as an order that is already paid. See {@link CommandNotFound}.
+ * @fix Refresh the resource state and choose an operation permitted by its current state.
+ * @verify bun run test -- src/returned-failure.test.ts
+ */
+export const CommandConflict = defineFailure('journal.conflict', {
+  status: 409,
+  data: CommandRefusal,
+  message: '{detail}',
+  remediation: 'Refresh the resource state and choose an operation permitted by its current state.',
+});
+/** A {@link CommandConflict} failure value. */
+export type CommandConflict = ReturnType<typeof CommandConflict>;
+
+/** The pinned workflow code is unavailable or incompatible; keep the run unchanged until an operator restores it.
+ * @fix Restore the pinned workflow version and original node shape before resuming the run.
+ * @verify bun run test -- src/returned-failure.test.ts
+ */
+export const WorkflowStranded = defineFailure('journal.workflow_stranded', {
+  status: 409,
+  data: z.object({
+    runId: z.string(),
+    name: z.string(),
+    version: z.number().int(),
+    reason: z.enum(['WORKFLOW_UNKNOWN', 'WORKFLOW_SHAPE_CHANGED']),
+    detail: z.string(),
+  }),
+  message: '{detail}',
+  remediation: 'Restore the pinned workflow version and original node shape before resuming the run.',
+});
+export type WorkflowStranded = ReturnType<typeof WorkflowStranded>;
+
+/** A start found a limit it holds full or paused (`reason`). `limitName` names it: `workflow/<name>` for the
+ * workflow's own `concurrency.limit` and `total`, else a `j.limit`. `limit` is the count that is reached (0 for a
+ * pause), `key` the start's concurrency key (`null` without one: only a `total` can block such a start). `running` lists the runs of the caller's own scope that
+ * hold the limit, oldest first, at most 100; another scope's run ids are never shown. Returned when `onBusy` is
+ * `'refuse'`, for a pause, for a full limit other than the workflow's own `perKey`, and always for a child run: a
+ * child cannot join a run that another parent started.
+ * @fix Wait for one of the running runs to finish, start the run with another concurrency key, or ask an operator to
+ * raise or resume the limit (`journal.limits`).
+ * @verify bun run test -- src/workflow/concurrency.test.ts
+ */
+export const WorkflowBusy = defineFailure('journal.workflow_busy', {
+  status: 409,
+  data: z.object({
+    name: z.string(),
+    // `''` in a failure recorded before a missing key became `null`.
+    key: z.string().nullable(),
+    limit: z.number().int(),
+    running: z.array(z.string()),
+    // Added with named limits: a failure recorded before them has neither.
+    limitName: z.string().optional(),
+    reason: z.enum(LIMIT_BUSY_REASONS).optional(),
+    detail: z.string(),
+  }),
+  message: '{detail}',
+  remediation:
+    'Wait for one of the running runs to finish, start the run with another concurrency key, or raise or resume the limit (journal.limits).',
+});
+/** A {@link WorkflowBusy} failure value. */
+export type WorkflowBusy = ReturnType<typeof WorkflowBusy>;
+
+/** A run tried to start a node past its workflow's `limits.transitions`, so it stops: it compensates, then ends `failed`
+ * with this failure as its error. `limit` is the workflow's `limits.transitions`; `transitions` is the count the run
+ * had reached. A transition is the first try of a node: each visit of a node in a loop counts, and so does a node its
+ * `when` skips; a retry and an undo do not.
+ * @fix Find why the run loops (a `next` that never leaves the loop), or raise `limits.transitions` when the loop is as long as the work needs.
+ * @verify bun run test -- src/workflow/transitions.pg.test.ts
+ */
+export const WorkflowTransitionLimit = defineFailure('journal.workflow_transition_limit', {
+  status: 409,
+  data: z.object({ runId: z.string(), name: z.string(), limit: z.number().int(), transitions: z.number().int(), detail: z.string() }),
+  message: '{detail}',
+  remediation:
+    'Find why the run loops (a next that never leaves the loop), or raise limits.transitions when the loop is as long as the work needs.',
+});
+/** A {@link WorkflowTransitionLimit} failure value. */
+export type WorkflowTransitionLimit = ReturnType<typeof WorkflowTransitionLimit>;
+
+/** What `def.read` returns when a stored value of the run does not fit its schema. `field` is `input`, `output` or
+ * `results.<node>`; `detail` is the `WORKFLOW_READ_MISMATCH` message, and the cause is the schema's `InvalidInput`,
+ * with its issues.
+ * @fix Read the run untyped with journal.workflows.run, or let the schema take the values older runs stored.
+ * @verify bun run test -- src/workflow/def-read.test.ts
+ */
+export const WorkflowReadMismatch = defineFailure('journal.workflow_read_mismatch', {
+  status: 409,
+  data: z.object({ runId: z.string(), field: z.string(), detail: z.string() }),
+  message: '{detail}',
+  remediation: 'Read the run untyped with journal.workflows.run, or let the schema take the values older runs stored.',
+});
+/** A {@link WorkflowReadMismatch} failure value. */
+export type WorkflowReadMismatch = ReturnType<typeof WorkflowReadMismatch>;
+
+/** `def.settled` or `def.startAndWait` stopped waiting before the run ended. The run goes on: a wait never cancels it.
+ * `runId` is the run to read again later (`def.settled`), or to cancel on purpose.
+ * @fix Read the run again with def.settled, or take the run id and return to the caller now; do not start the work again.
+ * @verify bun run test -- src/workflow/outcomes.test.ts
+ */
+export const WorkflowPending = defineFailure('journal.workflow_pending', {
+  status: 408,
+  data: z.object({ runId: z.string() }),
+  message: 'workflow run {runId} has not ended yet',
+  remediation:
+    'Read the run again with def.settled, or take the run id and return to the caller now; do not start the work again.',
+});
+/** A {@link WorkflowPending} failure value. */
+export type WorkflowPending = ReturnType<typeof WorkflowPending>;
+
+/** A run that `def.startAndWait` waited for ended `failed` (or `expired`): a step died, or a node refused. `error` is the text the run recorded.
+ * @fix Read the run (def.read) to see which node failed, and retry that step or start the run again.
+ * @verify bun run test -- src/workflow/outcomes.test.ts
+ */
+export const WorkflowRunFailed = defineFailure('journal.workflow_run_failed', {
+  status: 422,
+  data: z.object({ runId: z.string(), state: z.enum(['failed', 'expired']), error: z.string() }),
+  message: 'workflow run {runId} ended {state}: {error}',
+  remediation: 'Read the run (def.read) to see which node failed, and retry that step or start the run again.',
+});
+/** A {@link WorkflowRunFailed} failure value. */
+export type WorkflowRunFailed = ReturnType<typeof WorkflowRunFailed>;
+
+/** A run that `def.startAndWait` waited for was cancelled. `reason` is the cancel's reason, or `null` when none was recorded.
+ * @fix Start the run again if the work is still wanted.
+ * @verify bun run test -- src/workflow/outcomes.test.ts
+ */
+export const WorkflowRunCancelled = defineFailure('journal.workflow_run_cancelled', {
+  status: 409,
+  data: z.object({ runId: z.string(), reason: z.string().nullable() }),
+  message: 'workflow run {runId} was cancelled',
+  remediation: 'Start the run again if the work is still wanted.',
+});
+/** A {@link WorkflowRunCancelled} failure value. */
+export type WorkflowRunCancelled = ReturnType<typeof WorkflowRunCancelled>;
+
+/** Failures owned by command execution, in addition to the command definition's inferred refusals. */
+export const COMMAND_FAILURES = [...SCHEMA_FAILURES, ...TRANSACTION_FAILURES, CommandConflict] as const;
+export type CommandFailure = ReturnType<(typeof COMMAND_FAILURES)[number]>;

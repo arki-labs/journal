@@ -1,6 +1,6 @@
 {
   "name": "@arki/journal",
-  "version": "0.2.1",
+  "version": "0.4.1",
   "description": "A journal for Drizzle entities: every change is an immutable event row, the current state is a normal table row, and both are written in one transaction. Inline projections run in the same transaction; effects run after commit from a job table.",
   "license": "MIT",
   "repository": {
@@ -35,6 +35,21 @@
       "import": "./dist/pg.js",
       "default": "./dist/pg.js"
     },
+    "./foreman": {
+      "types": "./dist/foreman/index.d.ts",
+      "import": "./dist/foreman/index.js",
+      "default": "./dist/foreman/index.js"
+    },
+    "./http": {
+      "types": "./dist/http.d.ts",
+      "import": "./dist/http.js",
+      "default": "./dist/http.js"
+    },
+    "./http/webhooks": {
+      "types": "./dist/http/webhooks.d.ts",
+      "import": "./dist/http/webhooks.js",
+      "default": "./dist/http/webhooks.js"
+    },
     "./dot": {
       "types": "./dist/dot.d.ts",
       "import": "./dist/dot.js",
@@ -45,15 +60,50 @@
       "import": "./dist/errors.js",
       "default": "./dist/errors.js"
     },
+    "./contract": {
+      "types": "./dist/contract.d.ts",
+      "import": "./dist/contract.js",
+      "default": "./dist/contract.js"
+    },
     "./orpc": {
       "types": "./dist/orpc.d.ts",
       "import": "./dist/orpc.js",
       "default": "./dist/orpc.js"
     },
+    "./projection": {
+      "types": "./dist/projection.d.ts",
+      "import": "./dist/projection.js",
+      "default": "./dist/projection.js"
+    },
+    "./event-map": {
+      "types": "./dist/event-map.d.ts",
+      "import": "./dist/event-map.js",
+      "default": "./dist/event-map.js"
+    },
     "./testing": {
       "types": "./dist/testing.d.ts",
       "import": "./dist/testing.js",
       "default": "./dist/testing.js"
+    },
+    "./event-log-contract": {
+      "types": "./dist/event-log-contract.d.ts",
+      "import": "./dist/event-log-contract.js",
+      "default": "./dist/event-log-contract.js"
+    },
+    "./postgres": {
+      "types": "./dist/postgres.d.ts",
+      "import": "./dist/postgres.js",
+      "default": "./dist/postgres.js"
+    },
+    "./kurrentdb": {
+      "types": "./dist/kurrentdb.d.ts",
+      "import": "./dist/kurrentdb.js",
+      "default": "./dist/kurrentdb.js"
+    },
+    "./zod": {
+      "types": "./dist/zod.d.ts",
+      "import": "./dist/zod.js",
+      "default": "./dist/zod.js"
     },
     "./package.json": "./package.json"
   },
@@ -66,26 +116,46 @@
     "README.md",
     "llms.txt",
     "docs/agent-guide.md",
+    "docs/api-reference.md",
+    "docs/upgrades/**",
     "LICENSE",
     "package.json"
   ],
   "dependencies": {
-    "@arki/log": "0.1.0",
-    "@paralleldrive/cuid2": "^3.3.0",
+    "@arki/async": "0.3.0",
+    "@arki/contracts": "0.4.1",
+    "@arki/db": "0.5.1",
+    "@arki/failure": "0.3.0",
+    "@arki/log": "0.4.0",
+    "@arki/resilience": "0.3.2",
+    "@arki/schema": "0.3.0",
+    "@opentelemetry/api": "^1.9.1",
     "drizzle-orm": "1.0.0-rc.4",
     "zod": "4.6.5"
   },
   "peerDependencies": {
-    "@arki/dot": "^0.6.1",
+    "@arki/admin": "^0.3.0",
+    "@arki/dot": "^0.10.0",
+    "@arki/http": "^0.4.1",
     "@electric-sql/pglite": "^0.4.6",
+    "@kurrent/kurrentdb-client": "^1.3.1",
     "@orpc/server": "^1.15.5",
-    "drizzle-kit": "1.0.0-rc.4"
+    "drizzle-kit": "^1.0.0-rc.4"
   },
   "peerDependenciesMeta": {
+    "@arki/admin": {
+      "optional": true
+    },
     "@arki/dot": {
       "optional": true
     },
+    "@arki/http": {
+      "optional": true
+    },
     "@electric-sql/pglite": {
+      "optional": true
+    },
+    "@kurrent/kurrentdb-client": {
       "optional": true
     },
     "@orpc/server": {

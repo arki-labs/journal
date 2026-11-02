@@ -81,17 +81,21 @@ function keyColumnOf(kind, table, key) {
     }
     return column;
 }
-export function defineEntity(kind, table, key) {
+/**
+ * Standalone, it cannot see a journal default, so `eventStorage` is `'stored'` unless given.
+ * `journal.entity` resolves the journal's default and passes it here.
+ */
+export function defineEntity(kind, table, key, eventStorage = 'stored') {
     assertStoredName('entity kind', kind);
     const keyColumn = keyColumnOf(kind, table, key);
     const uuidKey = sqlTypeOf(keyColumn) === 'uuid';
     const keyLimit = keyLimitOf(keyColumn);
-    return builder(kind, table, key, keyColumn, uuidKey, keyLimit, new Map(), new Map(), null);
+    return builder(kind, table, key, keyColumn, uuidKey, keyLimit, eventStorage, new Map(), new Map(), null);
 }
-function builder(kind, table, key, keyColumn, uuidKey, keyLimit, events, reducers, 
+function builder(kind, table, key, keyColumn, uuidKey, keyLimit, eventStorage, events, reducers, 
 /** The first `.on` event type, once one is declared. `.create` is refused after it. */
 firstOn) {
-    const declare = (event, next, sealedBy) => builder(kind, table, key, keyColumn, uuidKey, keyLimit, new Map([...events, [event.type, event]]), new Map([...reducers, [event.type, next]]), sealedBy);
+    const declare = (event, next, sealedBy) => builder(kind, table, key, keyColumn, uuidKey, keyLimit, eventStorage, new Map([...events, [event.type, event]]), new Map([...reducers, [event.type, next]]), sealedBy);
     const create = (event, reduce) => {
         if (firstOn !== null) {
             throw new JournalError('BAD_DEFINITION', 'entity', kind, `journal: entity "${kind}": declare .create(${event.type}) before any .on; .on(${firstOn}) came first`);
@@ -109,7 +113,7 @@ firstOn) {
         }
         return declare(event, { ...current, on: reduce }, firstOn ?? event.type);
     };
-    return { kind, table, key, keyColumn, uuidKey, keyLimit, events, reducers, create, on };
+    return { kind, table, key, keyColumn, uuidKey, keyLimit, eventStorage, events, reducers, create, on };
 }
 /**
  * A copy of `value` without the own keys that hold `undefined`. In a patch,

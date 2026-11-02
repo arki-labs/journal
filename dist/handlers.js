@@ -1,5 +1,6 @@
 import { JournalError } from './errors.js';
 import { assertStoredName } from './id.js';
+import { journalOwnedEffect } from './internal-context.js';
 /** An entity has a `kind`; an array of entities does not. */
 function toList(entity) {
     return 'kind' in entity ? [entity] : entity;
@@ -32,14 +33,14 @@ export function defineProjection(name, entity, on, opts) {
     };
 }
 /** Every effect handler gets these. A need must not take one of their names. */
-const builtInContext = new Set(['jobId', 'signal', 'db', 'run']);
+const builtInContext = new Set(['jobId', 'signal', 'db', 'run', 'accept']);
 /** Declare one thing an effect needs: `j.effect('order-mail', order, { mailer: need<Mailer>() }, { ... })`. */
 export const need = () => ({});
 function defineEffect(name, entity, needs, on) {
     assertStoredName('effect name', name);
     for (const key of Object.keys(needs)) {
         if (builtInContext.has(key))
-            throw new JournalError('BAD_DEFINITION', 'effect', name, `journal: effect "${name}" has a need named "${key}", but the handler context already has "jobId", "signal", "db" and "run"; give the need another name`);
+            throw new JournalError('BAD_DEFINITION', 'effect', name, `journal: effect "${name}" has a need named "${key}", but the handler context already has "jobId", "signal", "db", "run" and "accept"; give the need another name`);
     }
     const handlers = on;
     return withSchedule({
@@ -52,16 +53,25 @@ function defineEffect(name, entity, needs, on) {
             // A job was queued for this type. Running nothing would acknowledge it silently.
             if (handler === undefined)
                 throw new Error(`effect "${name}" has no handler for "${event.type}", but a job was queued for it; add a handler for this event to the effect, or delete the job if the event is no longer handled`);
-            await handler(event, ctx);
+            return await handler(event, ctx);
         },
     }, {});
 }
 const INT4_MAX = 2_147_483_647;
+/**
+ * A job priority as the jobs table holds it: an integer within 32 bits. Checked where a number is declared, and for a
+ * function, on each value it gives when its job is written.
+ */
+export function checkedPriority(effectName, priority) {
+    if (!Number.isInteger(priority) || Math.abs(priority) > INT4_MAX)
+        throw new JournalError('BAD_DEFINITION', 'effect', effectName, `journal: effect "${effectName}": priority must be an integer within 32 bits, got ${String(priority)}`);
+    return priority;
+}
 /** Attach a schedule to an effect, checked once: a job row must be able to hold it. */
 export function withSchedule(effect, schedule) {
-    const { priority = 0, delaySeconds = 0 } = schedule;
-    if (!Number.isInteger(priority) || Math.abs(priority) > INT4_MAX)
-        throw new JournalError('BAD_DEFINITION', 'effect', effect.name, `journal: effect "${effect.name}": priority must be an integer within 32 bits, got ${String(priority)}`);
+    const { priority, delaySeconds = 0 } = schedule;
+    if (typeof priority === 'number')
+        checkedPriority(effect.name, priority);
     if (!Number.isFinite(delaySeconds) || delaySeconds < 0)
         throw new JournalError('BAD_DEFINITION', 'effect', effect.name, `journal: effect "${effect.name}": delaySeconds must be a finite number of seconds, zero or more, got ${String(delaySeconds)}`);
     if (schedule.delaySeconds !== undefined && schedule.runAt !== undefined)
@@ -78,6 +88,18 @@ export function effectFor() {
         return rest.length === 1 ? defineEffect(name, entity, {}, rest[0]) : defineEffect(name, entity, rest[0], rest[1]);
     }
     return effect;
+}
+/**
+ * `j.effect` for the workflow runner: the handlers run the engine's own commands (a checkpoint, a timer, a start). No
+ * app gets this: the marker tells the worker to add the owned fields to the context (`internal-context.ts`).
+ */
+export function ownedEffectFor() {
+    return (name, entity, needs, on) => {
+        const declared = defineEffect(name, entity, needs, on);
+        // Marked before `withSchedule` closes over it, so a later `.withSchedule(...)` keeps the marker.
+        const owned = { ...declared, [journalOwnedEffect]: true };
+        return withSchedule(owned, declared.schedule);
+    };
 }
 function defineTap(name, entity, needs, on) {
     assertStoredName('effect name', name);
@@ -130,6 +152,15 @@ export function bindEffect(effect, services) {
     return withSchedule({ ...effect, needs: {}, run: (event, ctx) => effect.run(event, { ...given, ...ctx }) }, effect.schedule);
 }
 /**
+ * Give one effect its services from `from`, which answers per handler ref. An effect with `bindPerWorkflow`
+ * (`workflow.step`) is asked once per workflow; any other effect is asked once, as `bindEffect` does.
+ */
+export function bindEffectFrom(effect, from) {
+    return effect.bindPerWorkflow === undefined
+        ? bindEffect(effect, from({ kind: 'effect', name: effect.name }))
+        : effect.bindPerWorkflow(workflow => from({ kind: 'effect', name: effect.name, workflow }));
+}
+/**
  * The effects and taps as they run: each bound to its services from `services`.
  * A handler `j.compose` already bound needs nothing, so it gets nothing. Throws on the first
  * missing service, so a worker refuses to start instead of failing job after job.
@@ -137,7 +168,7 @@ export function bindEffect(effect, services) {
 export function bindHandlers(handlers, services) {
     const of = (kind, name) => services?.({ kind, name }) ?? {};
     return {
-        effects: handlers.effects.map(effect => bindEffect(effect, of('effect', effect.name))),
+        effects: handlers.effects.map(effect => bindEffectFrom(effect, ref => services?.(ref) ?? {})),
         taps: handlers.taps.map(tap => bindTap(tap, of('tap', tap.name))),
     };
 }

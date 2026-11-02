@@ -1,14 +1,17 @@
-import { eq, getTableColumns, is } from 'drizzle-orm';
+/**
+ * Stored values: exact-id checks, value comparison, the JSON round-trip check,
+ * freezing, and the root-database guard. Reading and writing rows is `store`'s job.
+ * Imports only leaf files (`types`, `errors`). Must not import `journal`, `api`,
+ * `write`, `command`, `history` or `worker`.
+ */
+import { getTableColumns, is } from 'drizzle-orm';
 import { PgAsyncTransaction } from 'drizzle-orm/pg-core';
+import { InvalidInput, isSchemaFailure } from '@arki/failure';
+import { parse } from '@arki/schema';
 import { JournalError } from './errors.js';
 /** A select row has every column of its table. The check is real; the guard narrows. */
 export function isRowOf(table, value) {
     return Object.keys(getTableColumns(table)).every(column => column in value);
-}
-export async function loadRow(db, entity, id, lock) {
-    const query = db.select().from(entity.table).where(eq(entity.keyColumn, id)).limit(1);
-    const rows = lock ? await query.for('update') : await query;
-    return rows[0] ?? null;
 }
 /**
  * The id the caller passes must be exactly the key the database stores. A database can treat
@@ -53,23 +56,6 @@ export function assertStoredId(entity, row, id) {
         throw new JournalError('ID_MISMATCH', entity.kind, id, `the stored key is ${JSON.stringify(stored)} but the id given is ${JSON.stringify(id)}; use the stored form`);
     }
 }
-/** Insert, update or delete the row so it matches `next`. Returns the stored row. */
-export async function saveReplayed(db, entity, id, current, next) {
-    const erased = entity.table;
-    if (next === null) {
-        if (current !== null)
-            await db.delete(erased).where(eq(entity.keyColumn, id));
-        return null;
-    }
-    const saved = current === null
-        ? await db.insert(erased).values(next).returning()
-        : await db.update(erased).set(next).where(eq(entity.keyColumn, id)).returning();
-    const row = saved[0];
-    if (row === undefined || !isRowOf(entity.table, row)) {
-        throw new Error(`journal: saving ${id} returned no complete row`);
-    }
-    return row;
-}
 export function toRecord(value) {
     return { ...value };
 }
@@ -109,7 +95,7 @@ function sameKeys(left, right, same) {
     return keys.length === rightKeys.length && keys.every(key => same(left[key], right[key]));
 }
 /** An object literal shape: prototype `Object.prototype` or `null`. A `Set`, `Map`, `Date` or class instance is not one. */
-function isPlainObject(value) {
+export function isPlainObject(value) {
     if (typeof value !== 'object' || value === null)
         return false;
     const proto = Object.getPrototypeOf(value);
@@ -192,25 +178,35 @@ function sameJson(a, b) {
     return false;
 }
 /**
+ * Sync parse that reports bad data instead of throwing it: replay and the round-trip
+ * check branch on the result. Invalid input carries issues; async schemas and validator
+ * defects remain canonical schema failures for the caller to propagate.
+ */
+export function safeParse(schema, value) {
+    const parsed = parse(schema, value);
+    return isSchemaFailure(parsed) ? { success: false, error: parsed } : { success: true, data: parsed };
+}
+/**
  * Throws `UNSTABLE_SCHEMA` unless the value survives JSON storage and a second parse
  * unchanged. Replay depends on this. A value JSON cannot encode (a `bigint`, a cycle)
  * is the same failure, with the serializer's error as `cause`.
  */
 export function assertRoundTrips(schema, value, kind, id, what) {
-    let stable;
+    let stored;
     try {
         // Not structuredClone: the point is what JSON storage does to the value (Dates become strings).
         const text = JSON.stringify(value);
-        const stored = JSON.parse(text);
-        const again = schema.safeParse(stored);
-        stable = again.success && sameJson(again.data, value);
+        stored = JSON.parse(text);
     }
     catch (error) {
         throw new JournalError('UNSTABLE_SCHEMA', kind, id, `${what}: the value cannot be stored as JSON`, {
             cause: error,
         });
     }
-    if (!stable)
+    const again = safeParse(schema, stored);
+    if (!again.success && !InvalidInput.is(again.error))
+        return again.error;
+    if (!(again.success && sameJson(again.data, value)))
         throw new JournalError('UNSTABLE_SCHEMA', kind, id, `${what}: the schema must accept its own stored output unchanged`);
 }
 export function assertRootDb(db, verb) {

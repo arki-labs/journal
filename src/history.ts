@@ -1,20 +1,26 @@
 /**
  * Reading the log: decoding stored events, the log queries, history-completeness
  * checks, and `replay`, `verify`, `repair`, `rerun`.
- * May import `fold`, `storage`, leaf files, and result types from `api`.
+ * May import `event-log`, `fold`, `storage`, `store`, leaf files, and result types from `api`.
  * Must not import `journal`, `write`, `command` or `worker`.
  */
-import type { z } from 'zod';
-import { and, asc, eq, gt, inArray, max, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
+
+import type { SchemaFailure } from '@arki/failure';
+import type { SchemaOutput, StandardSchemaV1 } from '@arki/schema';
+import { InvalidInput, isFailure, isSchemaFailure } from '@arki/failure';
 
 import type { ForgetResult, ReplayResult, VerifyResult } from './api.js';
-import type { JournalTables } from './pg.js';
+import type { EventLog, EventLogPosition, JoinedLog } from './event-log.js';
+import type { JournalTables, StoredEventRow } from './pg.js';
+import type { PgStore } from './store.js';
 import type {
   AnyEventDef,
   DbHandle,
   EntityDef,
   EntityId,
   EntityTable,
+  EventStorage,
   Projection,
   Recorded,
   Row,
@@ -22,23 +28,28 @@ import type {
 } from './types.js';
 import { debugReplay } from './debug.js';
 import { JournalError } from './errors.js';
+import { globalOrderOf, logOn, routeOf, streamOf } from './event-log.js';
 import { findEventDefinition, fold, hasDeclaredEventType } from './fold.js';
+import { rollbackOnFailure } from './rollback.js';
 import {
   assertExactId,
   assertStoredId,
   assertStoredValues,
   deepFreeze,
   isRowOf,
-  loadRow,
+  safeParse,
   sameValue,
-  saveReplayed,
   toRecord,
 } from './storage.js';
 
-/** What the log functions need from the journal: the meta schema and the journal tables. */
-export type HistoryDeps<Meta extends z.ZodObject> = {
+/** What the log functions need from the journal: the meta schema, the journal tables and its store. */
+export type HistoryDeps<Meta extends StandardSchemaV1<unknown, Record<string, unknown>>> = {
   readonly metaSchema: Meta;
   readonly tables: JournalTables;
+  /** Entity rows. `forget` still queries `tables` for the cursor lock and the job copies. */
+  readonly store: PgStore;
+  /** The built-in log: where `'stored'` events are. An entity with its own log reads that one. */
+  readonly log: JoinedLog;
 };
 
 /**
@@ -78,21 +89,34 @@ function assertRowNotAhead(kind: string, id: string, folded: object | null, top:
   }
 }
 
-export function createHistory<Meta extends z.ZodObject>(deps: HistoryDeps<Meta>) {
-  type MetaOut = z.output<Meta>;
-  const { metaSchema } = deps;
-  const eventsTable = deps.tables.events;
+/** The history verbs read the log back. A transient entity keeps none, so the verb is refused up front. */
+function assertStoredEvents(
+  entity: { readonly kind: string; readonly eventStorage: EventStorage },
+  id: string,
+  verb: string,
+): void {
+  if (entity.eventStorage !== 'transient') return;
+  throw new JournalError(
+    'NO_HISTORY',
+    entity.kind,
+    id,
+    `${verb}: entity "${entity.kind}" is declared with events: 'transient' and keeps no events`,
+  );
+}
 
-  /**
-   * Turn a stored log row into a recorded event, parsing data and meta with
-   * their current schemas. `id` is the row's entity id as the caller types it.
-   */
+/**
+ * Turns a stored log row into a recorded event, parsing data and meta with their current schemas. `id` is the row's
+ * entity id as the caller types it. Workflows decode the events a wait takes with this too, so a wait reads an event as
+ * replay and the worker read it.
+ */
+export function createEventDecoder<Meta extends StandardSchemaV1<unknown, Record<string, unknown>>>(metaSchema: Meta) {
+  type MetaOut = SchemaOutput<Meta>;
   /**
    * Lift a row's data from the schema version it was written at to the event's current
    * one, one step at a time. Each step parses with its own `from` schema first, so a bad
    * row names the version it failed at. Data already at the current version is returned as is.
    */
-  const upcast = (row: typeof eventsTable.$inferSelect, def: AnyEventDef, at: string): unknown => {
+  const upcast = (row: StoredEventRow, def: AnyEventDef, at: string): unknown => {
     const fail = (why: string): never => {
       throw new JournalError('REPLAY_FAILED', row.kind, row.entityId, `${at}: ${why}`);
     };
@@ -103,7 +127,8 @@ export function createHistory<Meta extends z.ZodObject>(deps: HistoryDeps<Meta>)
     for (let version = row.schemaVersion; version < def.version; version += 1) {
       const step = def.upcasters[version - 1];
       if (step === undefined) return fail(`no upcaster for schema version ${version}`);
-      const old = step.from.safeParse(value);
+      const old = safeParse(step.from, value);
+      if (!old.success && !InvalidInput.is(old.error)) return old.error;
       if (!old.success) return fail(`the data does not fit schema version ${version}: ${old.error.message}`);
       try {
         value = step.up(old.data);
@@ -117,10 +142,10 @@ export function createHistory<Meta extends z.ZodObject>(deps: HistoryDeps<Meta>)
   };
 
   const decodeStoredEvent = <Id extends string>(
-    row: typeof eventsTable.$inferSelect,
+    row: StoredEventRow,
     def: AnyEventDef | undefined,
     id: Id,
-  ): Recorded<string, unknown, MetaOut, Id> => {
+  ): Recorded<string, unknown, MetaOut, Id> | SchemaFailure => {
     const at = `event ${row.id} ("${row.type}" at version ${row.version})`;
     if (def === undefined) {
       throw new JournalError(
@@ -130,7 +155,10 @@ export function createHistory<Meta extends z.ZodObject>(deps: HistoryDeps<Meta>)
         `${at}: the entity declares no event of this type`,
       );
     }
-    const data = def.schema.safeParse(upcast(row, def, at));
+    const lifted = upcast(row, def, at);
+    if (isSchemaFailure(lifted)) return lifted;
+    const data = safeParse(def.schema, lifted);
+    if (!data.success && !InvalidInput.is(data.error)) return data.error;
     if (!data.success) {
       const after = row.schemaVersion < def.version ? ` after upcasting from version ${row.schemaVersion}` : '';
       throw new JournalError(
@@ -140,7 +168,8 @@ export function createHistory<Meta extends z.ZodObject>(deps: HistoryDeps<Meta>)
         `${at}: the data does not fit the current schema${after}: ${data.error.message}`,
       );
     }
-    const meta = metaSchema.safeParse(row.meta);
+    const meta = safeParse<SchemaOutput<Meta>>(metaSchema, row.meta);
+    if (!meta.success && !InvalidInput.is(meta.error)) return meta.error;
     if (!meta.success) {
       throw new JournalError(
         'REPLAY_FAILED',
@@ -167,20 +196,49 @@ export function createHistory<Meta extends z.ZodObject>(deps: HistoryDeps<Meta>)
     });
   };
 
-  const loadHistory = async (db: DbHandle, kind: string, id: string) =>
-    db
-      .select()
-      .from(eventsTable)
-      .where(and(eq(eventsTable.kind, kind), eq(eventsTable.entityId, id)))
-      .orderBy(asc(eventsTable.version));
+  return decodeStoredEvent;
+}
 
-  const highestVersion = async (db: DbHandle, kind: string, id: string): Promise<number> => {
-    const [top] = await db
-      .select({ version: max(eventsTable.version) })
-      .from(eventsTable)
-      .where(and(eq(eventsTable.kind, kind), eq(eventsTable.entityId, id)));
-    return top?.version ?? 0;
+export function createHistory<Meta extends StandardSchemaV1<unknown, Record<string, unknown>>>(
+  deps: HistoryDeps<Meta>,
+) {
+  type MetaOut = SchemaOutput<Meta>;
+  const { metaSchema } = deps;
+  const { jobs: jobsTable, jobArchive } = deps.tables;
+
+  const decodeStoredEvent = createEventDecoder<Meta>(metaSchema);
+
+  /** The entity's own log on `db`: bound when it joins transactions, used as it is when it cannot. */
+  const logAt = (db: DbHandle, entity: { readonly kind: string; readonly eventStorage: EventStorage }) => {
+    const route = routeOf(entity.eventStorage, deps.log);
+    if (route.mode === 'transient')
+      throw new JournalError('NO_HISTORY', entity.kind, '', `entity "${entity.kind}" keeps no events`);
+    return route.mode === 'joined' ? route.log.bind(db) : route.log;
   };
+
+  /** A forwarded entity's log is behind while a forward job for it waits: the verb would read an old history. */
+  const assertNothingForwarding = async (
+    db: DbHandle,
+    entity: { readonly kind: string; readonly eventStorage: EventStorage },
+    id: string,
+    verb: string,
+  ): Promise<void> => {
+    if (routeOf(entity.eventStorage, deps.log).mode !== 'forwarded') return;
+    const pending = await deps.store.bind(db).jobs.pendingTop(streamOf(entity.kind, id));
+    if (pending !== null)
+      throw new JournalError(
+        'FORWARD_PENDING',
+        entity.kind,
+        id,
+        `${verb}: a forward job still carries version ${pending}, so the event log is behind the row`,
+      );
+  };
+
+  const loadHistory = (
+    db: DbHandle,
+    entity: { readonly kind: string; readonly eventStorage: EventStorage },
+    id: string,
+  ) => logAt(db, entity).stream(entity.kind, id);
 
   const replayFrom = async <Tbl extends EntityTable, E extends AnyEventDef, Key extends string>(
     db: DbHandle,
@@ -190,7 +248,7 @@ export function createHistory<Meta extends z.ZodObject>(deps: HistoryDeps<Meta>)
     throughVersion?: number,
   ) => {
     // The whole log, so `throughVersion` cannot hide an incomplete history behind an empty result.
-    const rows = await loadHistory(db, entity.kind, id);
+    const rows = await loadHistory(db, entity, id);
     const first = rows[0];
     if (first === undefined && current !== null) {
       throw new JournalError('NO_HISTORY', entity.kind, id, 'the row exists but the log holds no event for it');
@@ -203,6 +261,7 @@ export function createHistory<Meta extends z.ZodObject>(deps: HistoryDeps<Meta>)
     }
     assertNoHoles(entity.kind, id, rows);
     const all = decodeHistory(entity, id, rows);
+    if (isFailure(all)) return all;
     // The whole history decides whether the entity is alive, whatever `throughVersion` says.
     const full = fold(entity, null, id, all, 'replay').row;
     assertRowNotAhead(entity.kind, id, full, rows.at(-1)?.version ?? 0, current);
@@ -215,11 +274,16 @@ export function createHistory<Meta extends z.ZodObject>(deps: HistoryDeps<Meta>)
   const decodeHistory = <Tbl extends EntityTable, E extends AnyEventDef, Key extends string>(
     entity: EntityDef<string, Tbl, E, MetaOut, Key>,
     id: EntityId<Tbl, Key>,
-    rows: Awaited<ReturnType<typeof loadHistory>>,
-  ) =>
-    rows
-      .map(row => decodeStoredEvent(row, entity.events.get(row.type), id))
-      .filter(event => hasDeclaredEventType(entity, event));
+    rows: readonly StoredEventRow[],
+  ) => {
+    const events: Recorded<string, unknown, MetaOut, EntityId<Tbl, Key>>[] = [];
+    for (const row of rows) {
+      const event = decodeStoredEvent(row, entity.events.get(row.type), id);
+      if (isFailure(event)) return event;
+      events.push(event);
+    }
+    return events.filter(event => hasDeclaredEventType(entity, event));
+  };
 
   /**
    * No row, but a log. Either a create follows a delete, or the row was removed
@@ -233,10 +297,12 @@ export function createHistory<Meta extends z.ZodObject>(deps: HistoryDeps<Meta>)
     entity: EntityDef<string, Tbl, E, MetaOut, Key>,
     id: EntityId<Tbl, Key>,
     latestLogVersion: number,
-  ): Promise<void> => {
-    const rows = await loadHistory(db, entity.kind, id);
+  ): Promise<void | SchemaFailure> => {
+    const rows = await loadHistory(db, entity, id);
     if (rows[0]?.version !== 1) return;
-    if (fold(entity, null, id, decodeHistory(entity, id, rows), 'replay').row !== null) {
+    const events = decodeHistory(entity, id, rows);
+    if (isFailure(events)) return events;
+    if (fold(entity, null, id, events, 'replay').row !== null) {
       throw new JournalError(
         'CONFLICT',
         entity.kind,
@@ -251,9 +317,11 @@ export function createHistory<Meta extends z.ZodObject>(deps: HistoryDeps<Meta>)
     entity: EntityDef<string, Tbl, E, MetaOut, Key>,
     id: EntityId<Tbl, Key>,
     opts?: { readonly throughVersion?: number },
-  ): Promise<ReplayResult<Tbl, E, MetaOut, Key>> => {
+  ): Promise<ReplayResult<Tbl, E, MetaOut, Key> | SchemaFailure> => {
+    assertStoredEvents(entity, id, 'replay');
     assertExactId(entity, id);
-    const current = await loadRow(db, entity, id, false);
+    await assertNothingForwarding(db, entity, id, 'replay');
+    const current = await deps.store.bind(db).rows.load(entity, id, false);
     return replayFrom(db, entity, id, current, opts?.throughVersion);
   };
 
@@ -261,15 +329,19 @@ export function createHistory<Meta extends z.ZodObject>(deps: HistoryDeps<Meta>)
     db: DbHandle,
     entity: EntityDef<string, Tbl, E, MetaOut, Key>,
     id: EntityId<Tbl, Key>,
-  ): Promise<VerifyResult<Tbl, Key>> => {
+  ): Promise<VerifyResult<Tbl, Key> | SchemaFailure> => {
+    assertStoredEvents(entity, id, 'verify');
     assertExactId(entity, id);
-    const loaded = await loadRow(db, entity, id, false);
+    await assertNothingForwarding(db, entity, id, 'verify');
+    const loaded = await deps.store.bind(db).rows.load(entity, id, false);
     assertStoredId(entity, loaded, id);
     if (loaded !== null && !isRowOf(entity.table, loaded)) {
       throw new Error(`journal: ${entity.kind} ${id} row is missing columns`);
     }
     const actual = loaded;
-    const { row: expected } = await replayFrom(db, entity, id, actual);
+    const replayed = await replayFrom(db, entity, id, actual);
+    if (isFailure(replayed)) return replayed;
+    const { row: expected } = replayed;
     if (expected === null && actual === null) return { ok: true };
     if (expected === null || actual === null) return { ok: false, expected, actual };
     const want = toRecord(expected);
@@ -282,18 +354,23 @@ export function createHistory<Meta extends z.ZodObject>(deps: HistoryDeps<Meta>)
     db: DbHandle,
     entity: EntityDef<string, Tbl, E, MetaOut, Key>,
     id: EntityId<Tbl, Key>,
-  ): Promise<Row<Tbl> | null> => {
+  ): Promise<Row<Tbl> | null | SchemaFailure> => {
+    assertStoredEvents(entity, id, 'repair');
     assertExactId(entity, id);
     return db.transaction(async tx => {
-      const current = await loadRow(tx, entity, id, true);
+      const current = await deps.store.bind(tx).rows.load(entity, id, true);
+      // Under the row lock: no write can queue a forward job between the check and the rebuild.
+      await assertNothingForwarding(tx, entity, id, 'repair');
       assertStoredId(entity, current, id);
-      const { row: expected } = await replayFrom(tx, entity, id, current);
+      const replayed = await replayFrom(tx, entity, id, current);
+      if (isFailure(replayed)) return replayed;
+      const { row: expected } = replayed;
       debugReplay.debug('{kind} {id}: repair -> {value3}', {
         kind: entity.kind,
         id,
         value3: expected === null ? 'delete' : `v${expected.version}`,
       });
-      const saved = await saveReplayed(tx, entity, id, current, expected);
+      const saved = await deps.store.bind(tx).rows.saveReplayed(entity, id, current, expected);
       // Throwing rolls the transaction back, so the row stays as it was.
       if (saved !== null && expected !== null) assertStoredValues(entity, id, expected, saved, Object.keys(expected));
       return saved;
@@ -304,87 +381,204 @@ export function createHistory<Meta extends z.ZodObject>(deps: HistoryDeps<Meta>)
     db: DbHandle,
     entity: EntityDef<string, Tbl, E, MetaOut, Key>,
     id: EntityId<Tbl, Key>,
-  ): Promise<ForgetResult<Tbl>> => {
+  ): Promise<ForgetResult<Tbl> | SchemaFailure> => {
+    assertStoredEvents(entity, id, 'forget');
     assertExactId(entity, id);
-    return db.transaction(async tx => {
-      // The row lock first, so no write lands between the rewrite and the repair. Then every
-      // async cursor, so no projection batch in flight commits the data after it was erased.
-      await loadRow(tx, entity, id, true);
-      await tx.select({ name: deps.tables.cursors.name }).from(deps.tables.cursors).for('update');
-      const rows = await loadHistory(tx, entity.kind, id);
-      let erased = 0;
-      for (const row of rows) {
-        const def = entity.events.get(row.type);
-        if (def?.erased === undefined) continue;
-        // Decode as replay does, so the erased form starts from data the schema accepts.
-        const event = decodeStoredEvent(row, def, id);
-        const form = def.schema.safeParse(def.erased(event.data));
-        if (!form.success) {
-          throw new JournalError(
-            'BAD_DEFINITION',
-            entity.kind,
-            id,
-            `event "${row.type}": its erased form does not fit its own schema: ${form.error.message}`,
-          );
-        }
-        await tx
-          .update(eventsTable)
-          .set({
+    const refusal = rollbackOnFailure<ForgetResult<Tbl> | SchemaFailure>();
+    return db
+      .transaction(async tx => {
+        // The row lock first, so no write lands between the rewrite and the repair. Then every
+        // async cursor, so no projection batch in flight commits the data after it was erased.
+        await deps.store.bind(tx).rows.load(entity, id, true);
+        // A pending forward job would append the data as it was, after the erase.
+        await assertNothingForwarding(tx, entity, id, 'forget');
+        await tx.select({ name: deps.tables.cursors.name }).from(deps.tables.cursors).for('update');
+        const rows = await loadHistory(tx, entity, id);
+        let erased = 0;
+        for (const row of rows) {
+          const def = entity.events.get(row.type);
+          if (def?.erased === undefined) continue;
+          // Decode as replay does, so the erased form starts from data the schema accepts.
+          const event = decodeStoredEvent(row, def, id);
+          if (isFailure(event)) return refusal.settle(event);
+          const form = safeParse(def.schema, def.erased(event.data));
+          if (!form.success && !InvalidInput.is(form.error)) return refusal.settle(form.error);
+          if (!form.success) {
+            throw new JournalError(
+              'BAD_DEFINITION',
+              entity.kind,
+              id,
+              `event "${row.type}": its erased form does not fit its own schema: ${form.error.message}`,
+            );
+          }
+          const log = logAt(tx, entity);
+          if (log.erase === undefined)
+            throw new JournalError(
+              'NO_HISTORY',
+              entity.kind,
+              id,
+              'forget: this event log cannot rewrite events in place',
+            );
+          const stamped = await log.erase(row, { data: form.data, schemaVersion: def.version });
+          // Every effect job carries a copy of its event in `args`, and the archive keeps finished jobs
+          // for days. Both copies get the same erased data, schema version and stamp as the event row.
+          const erasedCopy = JSON.stringify({
             data: form.data,
             schemaVersion: def.version,
-            erasedAt: sql`coalesce(${eventsTable.erasedAt}, now())`,
-          })
-          .where(eq(eventsTable.seq, row.seq));
-        erased += 1;
-      }
-      // The row must match the history it now has. Repair on `tx` is a savepoint.
-      const row = await repair(tx, entity, id);
-      debugReplay.debug('{kind} {id}: forget -> {erased} events erased', { kind: entity.kind, id, erased });
-      return { erased, row };
-    });
+            erasedAt: stamped.erasedAt,
+          });
+          await tx
+            .update(jobsTable)
+            .set({ args: sql`${jobsTable.args} || ${erasedCopy}::jsonb` })
+            .where(and(eq(jobsTable.kind, 'effect'), sql`${jobsTable.args}->>'id' = ${row.id}`));
+          await tx
+            .update(jobArchive)
+            .set({ args: sql`${jobArchive.args} || ${erasedCopy}::jsonb` })
+            .where(and(eq(jobArchive.kind, 'effect'), sql`${jobArchive.args}->>'id' = ${row.id}`));
+          // A finished forward job keeps the write's events in the archive too: erase this one there.
+          await tx
+            .update(jobArchive)
+            .set({
+              args: sql`
+                jsonb_set(${jobArchive.args}, '{events}', (
+                  select jsonb_agg(case when e->>'id' = ${row.id} then e || ${erasedCopy}::jsonb else e end order by at)
+                  from jsonb_array_elements(${jobArchive.args}->'events') with ordinality as x(e, at)))
+              `,
+            })
+            .where(
+              and(
+                eq(jobArchive.kind, 'forward'),
+                eq(jobArchive.stream, streamOf(entity.kind, id)),
+                sql`${jobArchive.args}->'events' @> ${JSON.stringify([{ id: row.id }])}::jsonb`,
+              ),
+            );
+          erased += 1;
+        }
+        // The row must match the history it now has. Repair on `tx` is a savepoint.
+        const row = await repair(tx, entity, id);
+        if (isSchemaFailure(row)) return refusal.settle(row);
+        debugReplay.debug('{kind} {id}: forget -> {erased} events erased', { kind: entity.kind, id, erased });
+        return { erased, row };
+      })
+      .catch(refusal.recover);
   };
 
   const rerun = async <Tx extends TransactionSource<Tx>>(
     db: TransactionSource<Tx>,
     projection: Projection<MetaOut, Tx>,
-    opts?: { readonly afterSeq?: number; readonly batchSize?: number },
-  ): Promise<{ readonly events: number }> => {
+    opts?: { readonly after?: EventLogPosition | null; readonly batchSize?: number },
+  ): Promise<{ readonly events: number } | SchemaFailure> => {
     const batchSize = opts?.batchSize ?? 100;
+    for (const entity of projection.entities) assertStoredEvents(entity, projection.name, 'rerun');
     const kinds = projection.entities.map(entity => entity.kind);
-    let cursor = opts?.afterSeq ?? 0;
+    let position = opts?.after ?? null;
     let count = 0;
-    if (kinds.length === 0 || projection.types.size === 0) return { events: 0 };
+    const [first] = projection.entities;
+    if (first === undefined || projection.types.size === 0) return { events: 0 };
     for (;;) {
-      const rows = await db
-        .select()
-        .from(eventsTable)
-        .where(
-          and(
-            gt(eventsTable.seq, cursor),
-            inArray(eventsTable.kind, kinds),
-            inArray(eventsTable.type, [...projection.types]),
-          ),
-        )
-        .orderBy(asc(eventsTable.seq))
-        .limit(batchSize);
-      if (rows.length === 0) break;
-      await db.transaction(async tx => {
-        for (const row of rows) {
-          await projection.run(
-            tx,
-            decodeStoredEvent(row, findEventDefinition(projection.entities, row.kind, row.type), row.entityId),
-          );
-        }
+      // `compose` holds a projection to one log, so the first entity's log is every entity's.
+      const { events: rows, next } = await globalOrderOf(logAt(db, first), 'rerun').after(position, {
+        kinds,
+        types: [...projection.types],
+        limit: batchSize,
       });
+      if (rows.length === 0) break;
+      const refusal = rollbackOnFailure<void | SchemaFailure>();
+      const result = await db
+        .transaction(async tx => {
+          for (const row of rows) {
+            const event = decodeStoredEvent(
+              row,
+              findEventDefinition(projection.entities, row.kind, row.type),
+              row.entityId,
+            );
+            if (isFailure(event)) return refusal.settle(event);
+            await projection.run(tx, event);
+          }
+        })
+        .catch(refusal.recover);
+      if (isFailure(result)) return result;
       count += rows.length;
-      cursor = rows.at(-1)?.seq ?? cursor;
+      position = next;
       if (rows.length < batchSize) break;
     }
     debugReplay.debug('rerun {projectionName}: {count} events', { projectionName: projection.name, count });
     return { events: count };
   };
 
-  return { decodeStoredEvent, highestVersion, assertLogSaysGone, replay, verify, repair, forget, rerun };
+  /**
+   * Copy one entity kind's events from the log it uses now into `to`, for a store switch. Events
+   * go across as stored: same ids, versions, seqs and schema versions, and an erased event is
+   * erased again where `to` can. Appends repeat safely, so a copy cut short runs again from the
+   * start. Writes to the kind must be paused until the setting is flipped.
+   */
+  const copyLog = async (
+    db: DbHandle,
+    entity: { readonly kind: string; readonly eventStorage: EventStorage },
+    opts: { readonly to: 'stored' | EventLog; readonly batchSize?: number },
+  ): Promise<{ readonly events: number }> => {
+    const batchSize = opts.batchSize ?? 500;
+    assertStoredEvents(entity, '', 'copyLog');
+    const route = routeOf(entity.eventStorage, deps.log);
+    const target = opts.to === 'stored' ? deps.log : opts.to;
+    if (route.mode !== 'transient' && route.log === target)
+      throw new JournalError(
+        'BAD_DEFINITION',
+        entity.kind,
+        '',
+        `copyLog: entity "${entity.kind}" already uses that log`,
+      );
+    const [waiting] = await db
+      .select({ id: jobsTable.id })
+      .from(jobsTable)
+      .where(and(eq(jobsTable.kind, 'forward'), eq(jobsTable.jobName, entity.kind)))
+      .limit(1);
+    if (waiting !== undefined)
+      throw new JournalError(
+        'FORWARD_PENDING',
+        entity.kind,
+        '',
+        'copyLog: forward jobs still carry events of this kind, so the log is behind the rows; drain them first',
+      );
+    const from = globalOrderOf(logAt(db, entity), 'copyLog');
+    const to = logOn(target, db);
+    let position: EventLogPosition | null = null;
+    let copied = 0;
+    for (;;) {
+      const { events, next } = await from.after(position, { kinds: [entity.kind], limit: batchSize });
+      // The order keeps each entity's versions in sequence, so a run of one entity is one append.
+      let start = 0;
+      while (start < events.length) {
+        const first = events[start];
+        if (first === undefined) break;
+        let end = start + 1;
+        while (events[end]?.entityId === first.entityId) end += 1;
+        const run = events.slice(start, end);
+        await to.append({
+          kind: entity.kind,
+          entityId: first.entityId,
+          expectedVersion: first.version - 1,
+          events: run.map(({ position: _position, erasedAt: _erasedAt, ...event }) => event),
+        });
+        if (to.erase !== undefined) {
+          for (const event of run) {
+            if (event.erasedAt !== null)
+              await to.erase(event, { data: event.data, schemaVersion: event.schemaVersion });
+          }
+        }
+        start = end;
+      }
+      copied += events.length;
+      position = next;
+      if (events.length < batchSize) break;
+    }
+    debugReplay.debug('copyLog {kind}: {count} events', { kind: entity.kind, count: copied });
+    return { events: copied };
+  };
+
+  return { decodeStoredEvent, assertLogSaysGone, replay, verify, repair, forget, rerun, copyLog };
 }
 
-export type History<Meta extends z.ZodObject> = ReturnType<typeof createHistory<Meta>>;
+export type History<Meta extends StandardSchemaV1<unknown, Record<string, unknown>>> = ReturnType<
+  typeof createHistory<Meta>
+>;
