@@ -180,7 +180,7 @@ function shapeOf(nodes) {
  */
 const hashedFields = (entry) => {
     if (entry.kind === 'parallel') {
-        const branches = (entry.branches ?? []).map(branch => [branch.name, branch.shape.nodes.map(hashedFields)]);
+        const branches = (entry.branches ?? []).map(branch => [branch.name, branch.shape.nodes.map(node => hashedFields(node))]);
         return [entry.name, entry.kind, entry.undo, entry.wait ?? null, branches];
     }
     if (entry.kind === 'command')
@@ -255,7 +255,7 @@ export function signalWaits(nodes, prefix = '') {
     });
 }
 /** A branch name is part of a run id and a definition name, so it is a plain key. */
-const BRANCH_NAME = /^[A-Za-z0-9_-]+$/;
+const BRANCH_NAME = /^[\w-]+$/;
 /** Adds a node after checking the rules that need no types. */
 function withNode(state, node) {
     if (node.name === '')

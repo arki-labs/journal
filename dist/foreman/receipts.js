@@ -21,6 +21,7 @@ import { integer, jsonb, pgTable, varchar } from 'drizzle-orm/pg-core';
 import { z } from 'zod';
 import { ADMIN_ERROR_CODES, AdminError } from '@arki/admin/module';
 import { pendingReceiptSchema, settledReceiptSchema, storedReceiptSchema } from '@arki/admin/receipts';
+import { TransactionDefect } from '@arki/db/transaction';
 import { orThrow } from '@arki/failure';
 import { isJournalError } from '../index.js';
 /**
@@ -65,15 +66,13 @@ export function journalReceiptStore(options) {
     };
     return {
         async claim(pending) {
-            try {
-                return orThrow(await journal.run(db, claimCommand, { receipt: pending }, meta));
-            }
-            catch (error) {
-                // Two claims raced to create the row: the loser sees the winner's receipt.
-                if (isJournalError(error, 'CONFLICT'))
-                    return { claimed: false, receipt: await get(pending.executionId) };
-                throw error;
-            }
+            const claimed = await journal.run(db, claimCommand, { receipt: pending }, meta);
+            // The journal's append lock serialises its own claims, so a loser reads the winner's row above.
+            // A writer outside that lock loses only at the unique index: `journal.run` returns that CONFLICT
+            // as `TransactionDefect`, and the loser answers with the winner's receipt.
+            if (TransactionDefect.is(claimed) && isJournalError(claimed.cause, 'CONFLICT'))
+                return { claimed: false, receipt: await get(pending.executionId) };
+            return orThrow(claimed);
         },
         async settle(settled) {
             orThrow(await journal.run(db, settleCommand, { receipt: settled }, meta));

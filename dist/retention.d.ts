@@ -125,12 +125,12 @@ export declare const defaultRetention: {
  */
 export declare function parseRunKeep(keep: Keep, where: string): ResolvedKeep;
 /** Parse the journal-wide policy and fill the defaults. Throws `BAD_DEFINITION` on a bad value. */
-export declare function resolveRetention(retention: JobRetention | undefined): ResolvedRetention;
+export declare function resolveRetention(retention?: JobRetention): ResolvedRetention;
 /**
  * The keep rule for one archived row: the effect's (or queue job name's) override if it names this class,
  * else the journal's, which already holds the default. `dead`, `discarded` and `cancelled` share the `dead` class.
  */
-export declare function keepFor(policy: ResolvedRetention, outcome: ArchiveOutcome, override: EffectRetention | undefined): ResolvedKeep;
+export declare function keepFor(policy: ResolvedRetention, outcome: ArchiveOutcome, override?: EffectRetention): ResolvedKeep;
 /**
  * The keep rule for a run that ended as `outcome`. The workflow's own setting wins over the journal's. A workflow
  * that sets `failed` but not `cancelled` (or `expired`) gives both the same time, as the journal's default does.
@@ -139,7 +139,7 @@ export declare function runKeepFor(policy: ResolvedRetention, own: RunRetention,
 /** The `keep_until` of a run that ended at `now`. `false` is `now`: the next sweep deletes the row. Null keeps it. */
 export declare function runKeepUntil(keep: ResolvedKeep, now: Date): Date | null;
 /** How long a dead job stays retryable in the hot table, in milliseconds. */
-export declare function retryableForMs(policy: ResolvedRetention, override: EffectRetention | undefined): number;
+export declare function retryableForMs(policy: ResolvedRetention, override?: EffectRetention): number;
 /**
  * The `keep_until` to store when a row is archived at `now`. Null keeps it forever.
  * `'untilExported'` stores `now`: the prune step deletes a row past `keep_until` once the sink has it,

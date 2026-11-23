@@ -1,4 +1,4 @@
-Read-only mirror of `@arki/journal` v0.4.1. Source and issues: arki-labs/arki. Docs: https://arki.dev/packages/journal. Published 2026-11-02 with provenance https://www.npmjs.com/package/@arki/journal/v/0.4.1#provenance.
+Read-only mirror of `@arki/journal` v0.5.0. Source and issues: arki-labs/arki. Docs: https://arki.dev/packages/journal. Published 2026-11-23 with provenance https://www.npmjs.com/package/@arki/journal/v/0.5.0#provenance.
 
 # @arki/journal
 
@@ -188,7 +188,7 @@ The command context exposes `commandId` and `correlationId` for logs. To read a 
 | `journal.effect`  | one effect attempt, inside its lease, around the effect hooks                        | `journal.effect.name`, `journal.job.id`, `journal.job.attempt`, `journal.event.type`                                                              |
 | `journal.step`    | the body or the undo of one workflow step attempt, inside its `workflow.step` effect | `journal.workflow.name`, `journal.workflow.version`, `journal.workflow.run_id`, `journal.step.name`, `journal.step.attempt`, `journal.step.phase` |
 
-Each span ends with `journal.outcome`: `ok`, `failure` (a returned failure, with `failure.code`) or `defect` (a throw). A failure is not recorded as an exception event. Inputs, payloads, meta, results and error messages are never attributes. The span is the active span while the work runs, so a command that an effect or a step runs is its child. A tracer or context manager that throws changes nothing: the work runs once and its result passes through.
+Each span ends with `journal.outcome`: `ok`, `failure` (a returned failure, with `failure.code`) or `defect` (a throw). A failure is not recorded as an exception event. A returned failure sets the error status only when it is a fault (`isFault`: status 500 or higher); an expected outcome (4xx) leaves the status unset. A throw always sets it. Inputs, payloads, meta, results and error messages are never attributes. The span is the active span while the work runs, so a command that an effect or a step runs is its child. A tracer or context manager that throws changes nothing: the work runs once and its result passes through.
 
 ### Idempotent commands
 
@@ -604,7 +604,7 @@ journal.wake(); // after the commit
 
 Every commit that recorded events notifies a Postgres channel, `journal.wakeChannel` (`journal_wake`, or `<schema>_journal_wake` for tables in a schema), with the seq range as JSON: `{ "from": 12, "to": 14 }`. Postgres delivers `NOTIFY` at commit, so a listener hears exactly the commits that happened, in every process, including commits of transactions the caller manages, where `journal.wake()` cannot help. The payload is small and bounded; a listener loads what it needs by seq.
 
-A worker hears it through `listen`: `journal.worker(db, { listen })`, where `listen` is `onMessage => unlisten`. `LISTEN` needs a dedicated connection. With a `pg` pool, use `listenOnPool(db.$client, journal.wakeChannel)` from `@arki/db/pg`: it borrows one client for as long as the worker runs, replaces it when the connection drops, and closes it on `stop()`. When `DB_URL` goes through a pooler (Neon, Supabase), pass `services.sessionPool` from the `db()` plugin instead of `db.$client`: through the pooler, `LISTEN` hears nothing ([Hosted Postgres](../db/README.md#hosted-postgres)). With PGlite, `onMessage => client.listen(journal.wakeChannel, onMessage)`. `LISTEN` hears only what is sent after it ran, and a connection can drop, so the worker keeps polling (`pollMs`); the channel makes it prompt, not correct. A listening worker drains at once on every commit.
+A worker hears it through `listen`: `journal.worker(db, { listen })`, where `listen` is `onMessage => unlisten`. `LISTEN` needs a dedicated connection. With a `pg` pool, use `listenOnPool(db.$client, journal.wakeChannel)` from `@arki/db/pg`: it borrows one client for as long as the worker runs, replaces it when the connection drops, and closes it on `stop()`. When `DB_URL` goes through a pooler (Neon, Supabase), pass `services.sessionPool` from the `db()` plugin instead of `db.$client`: through the pooler, `LISTEN` hears nothing ([Hosted Postgres](../db/README.md#hosted-postgres)). With PGlite, `onMessage => client.listen(journal.wakeChannel, onMessage)`. `LISTEN` hears only what is sent after it ran, and a connection can drop, so the worker keeps polling (`pollMs`); the channel makes it prompt, not correct. A `listen` that cannot start returns its failure (`listenOnPool`: `db.listen_unavailable`): `worker.start()` resolves to it and the worker stays stopped, so a later `start()` tries again. In Dot, `journalWorker()` returns it from `start`, so the app's start fails with it. A listening worker drains at once on every commit.
 
 Taps or live queries? A tap reacts to an event in this process, after commit: a metric, a cache, a push to this process's subscribers. A page that shows the current rows of a table wants `@arki/live` instead: a statement trigger publishes every commit to the table, whether a command, a repository, raw SQL or a worker made it, so it needs no tap.
 
@@ -879,27 +879,30 @@ export const webhookSchema = webhookTables(); // in the schema module: drizzle-k
 export const webhooks = webhookSender({ tables, webhooks: webhookSchema, encryptionKey: env.WEBHOOK_KEY });
 
 // Once, when a partner registers an endpoint. Show the secret to them now: it is never readable again.
-const { id, secret } = await webhooks.subscribe(db, { partner: tenantId, url, events: ['order.placed'] });
+const subscribed = await webhooks.subscribe(db, { partner: tenantId, url, events: ['order.placed'] });
+if (isFailure(subscribed)) return subscribed; // InvalidInput: not public https, or bad input
+const { id, secret } = subscribed;
 
 // In the business transaction: the webhook exists if and only if the order commits.
 await db.transaction(async tx => {
   await journal.run(tx, placeOrder, input, meta);
-  await webhooks.dispatch(tx, { partner: tenantId, event: 'order.placed', payload: { orderId } });
+  orThrow(await webhooks.dispatch(tx, { partner: tenantId, event: 'order.placed', payload: { orderId } }));
 });
 
 journal.worker(db, { jobs: combineRunners(outboxRunner(...), webhooks.runner) });
 ```
 
-- **`dispatch(tx, …)`** needs a transaction. It writes the message once, as the body `{ type, timestamp, data }`, and one delivery row for each active subscription of that partner that lists the event. A payload over `maxPayloadBytes` (default 1 MiB) is refused.
+- **`dispatch(tx, …)`** needs a transaction. It writes the message once, as the body `{ type, timestamp, data }`, and one delivery row for each active subscription of that partner that lists the event. It throws only when given the root database (a caller bug). A payload that is not JSON returns `InvalidInput`; a body over `maxPayloadBytes` (default 1 MiB) returns `journal.webhook_payload_too_large`. Nothing is written for either.
 - **Signing failures** return the exact HTTP failure before delivery, record a failed/dead attempt with its safe code, and never acknowledge the job. Returned failures require an explicit retry predicate such as `.while(WebhookCryptoUnavailable)` on the configured backoff; a throw is retried by that backoff.
-- **Delivery** signs the stored bytes with [Standard Webhooks](https://www.standardwebhooks.com/). `webhook-id` is the message id, the same on every retry and replay, so a receiver dedupes on it (`verifyWebhook` with `standardWebhooks` from `@arki/http/webhooks` accepts it). It posts through `publicFetch()`, so an endpoint cannot reach a private address, even after a DNS change. Each try has `timeoutMs` (default 10 s). Any 2xx is delivered; anything else is retried.
+- **Delivery** signs the stored bytes with [Standard Webhooks](https://www.standardwebhooks.com/). `webhook-id` is the message id, the same on every retry and replay, so a receiver dedupes on it (`verifyWebhook` with `standardWebhooks` from `@arki/http/webhooks` accepts it). It posts through `publicFetch()`, so an endpoint cannot reach a private address, even after a DNS change. Each try has `timeoutMs` (default 10 s). Any 2xx is delivered; anything else is retried, recorded as `journal.webhook_delivery_failed`.
 - **Retries are the worker's.** `retry` (a `Backoff`, default from 5 s doubling to 1 h, 10 retries) sets when the next try runs and when the delivery is dead. A dead delivery stays in `journal_jobs` like any dead job: `journal.jobs(db, { status: 'dead' })` lists it and `journal.retry(db, id, op)` runs it again.
 - **Every try is a row** in `webhook_attempts`: `delivered`, `failed` (with `next_at`), `dead`, or `skipped` (the subscription was disabled). Because delivery is at least once, a crash between the send and the ack can add a second row for one try.
 - **Auto-disable.** `disableAfter` (default 5) dead deliveries in a row disable the subscription. A success resets the count. `enable(db, id)` turns it back on; `disable(db, id)` stops it by hand. A delivery queued before the subscription was disabled is recorded as `skipped`, not sent.
-- **`replay(db, { messageId, subscriptionId })`** sends a stored message again, with the same `webhook-id`. It refuses a subscription of another partner.
+- **`replay(db, { messageId, subscriptionId })`** sends a stored message again, with the same `webhook-id`. A subscription of another partner returns `journal.webhook_other_partner`; an unknown message or subscription returns `journal.webhook_not_found`. Neither queues anything.
 - **`rotateSecret(db, id, { windowSeconds })`** returns a new secret. For `windowSeconds` (default a day) both the old and the new secret sign each delivery, so the partner can switch without losing a message.
 - **Secrets at rest** are sealed with AES-GCM under `encryptionKey` (32 bytes, base64; keep it out of the database). The subscription id is bound in, so a sealed secret copied onto another row does not open.
-- `subscribe` takes public `https` URLs only. `rotateSecret`, `enable`, `disable` and `replay` act on the id they are given: check that the caller owns the subscription first.
+- `subscribe` takes public `https` URLs only: any other URL, or input that fails its schema, returns `InvalidInput` (`schema.invalid_input`) with the issues. `rotateSecret`, `enable` and `disable` return `journal.webhook_not_found` for an unknown id. They and `replay` act on the id they are given: check that the caller owns the subscription first.
+- A wrong `encryptionKey` throws `journal.webhook_configuration_invalid` (as `UnexpectedFailure`) when `webhookSender(...)` is built, so the app fails at boot.
 - `combineRunners(...)` from `@arki/journal` lets one worker run webhook deliveries and other queue jobs. Two runners that claim the same job name throw `BAD_DEFINITION`.
 
 Migration: add `webhookTables()` (or `webhookTables(schema)` next to `journalTables(schema)`) to the schema module, run `drizzle-kit generate`, and apply the migration before the first `subscribe`. It creates `webhook_subscriptions`, `webhook_messages` and `webhook_attempts`; existing tables are unchanged.
@@ -2202,6 +2205,22 @@ Rules and misuse fail in three ways:
 - App code that throws passes through unchanged.
 
 The agent guide has the [error table](docs/agent-guide.md#errors) and the [recovery verbs](docs/agent-guide.md#recovery-verbs). With `commandErrors()` from `@arki/journal/orpc`, a returned failure answers the client with its code and status.
+
+## Observability
+
+Spans (OpenTelemetry API only, tracer `@arki/journal`; nothing is exported until the app configures an SDK):
+
+| Span | When | Attributes |
+| --- | --- | --- |
+| `journal.command` | each command run, inside its transaction, around the command hooks | `journal.command.name`, `journal.command.id`, `journal.correlation_id`, `journal.command.idempotent`, `journal.outcome`, `failure.code` on a returned failure |
+| `journal.effect` | each effect attempt, inside its lease, around the effect hooks | `journal.effect.name`, `journal.job.id`, `journal.job.attempt`, `journal.event.type`, `journal.outcome`, `failure.code` on a returned failure |
+| `journal.step` | the body or the undo of each workflow step attempt | `journal.workflow.name`, `journal.workflow.version`, `journal.workflow.run_id`, `journal.step.name`, `journal.step.attempt`, `journal.step.phase`, `journal.outcome`, `failure.code` on a returned failure |
+
+`journal.outcome` is `ok`, `failure` or `defect` (a throw). Only a fault (status 500 or higher) or a throw sets error status. The span is active while the work runs. In a Dot app, a command run by a usecase nests under the `feature.<feature>.<usecase>` span, through the command's `db.transaction.once` span from `@arki/db`. Each job the worker runs (an effect, a workflow step inside it, a tap) starts its own trace: `journal.effect` is a root span, never a child of whatever called `worker.start()` (in Dot, the `dot.unit.start` span, which ends at once). Journal rows carry no OpenTelemetry context, so there is no producer trace to continue; `journal.correlation_id` links a job to the command that caused it. Inputs, payloads, meta, results and error messages are never attributes. Details: [Tracing](#tracing).
+
+Metrics: none.
+
+Not instrumented: worker start and polling — boot runs under Dot's `dot.unit.start` span, and an empty poll is not work. The queries — the database driver's instrumentation spans them.
 
 ## Limits
 

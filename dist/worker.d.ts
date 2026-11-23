@@ -1,4 +1,5 @@
 import type { IdGenerationFailure } from '@arki/contracts';
+import type { Failure } from '@arki/failure';
 import type { SchemaOutput, StandardSchemaV1 } from '@arki/schema';
 import type { EventLog, ForwardedLog, ForwardLag, ProjectionCursor } from './event-log.js';
 import type { History } from './history.js';
@@ -133,15 +134,15 @@ export type TapDispatchDeps<Meta extends StandardSchemaV1<unknown, Record<string
 };
 export declare function createTapDispatch<Meta extends StandardSchemaV1<unknown, Record<string, unknown>>, AppDb extends RootDb>(deps: TapDispatchDeps<Meta, AppDb>): (db: AppDb & RootDb, payload: string, services: HandlerServices | undefined) => Promise<void>;
 export declare function createWorkers<AppDb extends RootDb>(deps: WorkerDeps<AppDb>): {
-    worker: (db: AppDb & RootDb, opts?: {
+    worker: <ListenFailure extends Failure = never>(db: AppDb & RootDb, opts?: {
         readonly pollMs?: number;
         readonly batchSize?: number;
         readonly leaseSeconds?: number;
-        readonly listen?: WakeListener;
+        readonly listen?: WakeListener<ListenFailure>;
         readonly taps?: boolean;
         readonly services?: HandlerServices;
         readonly jobs?: JobRunner<AppDb>;
-    }) => JournalWorker;
+    }) => JournalWorker<ListenFailure>;
     wakeAll: () => void;
 };
 //# sourceMappingURL=worker.d.ts.map

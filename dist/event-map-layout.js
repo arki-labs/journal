@@ -42,7 +42,7 @@ export function ownersOf(document) {
 }
 /** The feature names with something to show, sorted. */
 export function featuresOf(document) {
-    return [...new Set([...ownersOf(document).values()])].toSorted();
+    return [...new Set(ownersOf(document).values())].sort();
 }
 const columnOf = (node) => (node.kind === 'feature' ? undefined : COLUMN_OF[node.kind]);
 /** A smooth curve from the side of `from` that faces `to`. */
@@ -64,7 +64,7 @@ export function layoutEventMap(document, feature) {
     const owners = ownersOf(document);
     const drawable = document.nodes.filter(node => columnOf(node) !== undefined);
     const owned = (node) => feature === undefined || owners.get(node.id) === feature;
-    const keep = new Set(drawable.filter(owned).map(node => node.id));
+    const keep = new Set(drawable.filter(node => owned(node)).map(node => node.id));
     const neighbours = new Set();
     if (feature !== undefined)
         for (const edge of document.edges) {
@@ -82,7 +82,10 @@ export function layoutEventMap(document, feature) {
     for (const node of shown)
         columns[columnOf(node) ?? 0]?.push(node);
     const rowOf = new Map();
-    const setRows = (column) => column.forEach((node, row) => rowOf.set(node.id, row));
+    const setRows = (column) => {
+        for (const [row, node] of column.entries())
+            rowOf.set(node.id, row);
+    };
     const byName = (a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id);
     const average = (node, fixed) => {
         const rows = edges.flatMap(({ edge }) => {
@@ -103,8 +106,8 @@ export function layoutEventMap(document, feature) {
     columns[0]?.sort((a, b) => average(a, commandIds) - average(b, commandIds) || byName(a, b));
     setRows(columns[0] ?? []);
     const placed = new Map();
-    columns.forEach((column, columnIndex) => {
-        column.forEach((node, row) => {
+    for (const [columnIndex, column] of columns.entries()) {
+        for (const [row, node] of column.entries()) {
             placed.set(node.id, {
                 node,
                 column: columnIndex,
@@ -112,8 +115,8 @@ export function layoutEventMap(document, feature) {
                 y: MARGIN_TOP + row * (NODE_HEIGHT + ROW_GAP),
                 context: !keep.has(node.id),
             });
-        });
-    });
+        }
+    }
     const placedEdges = edges.flatMap(({ edge, index }) => {
         const { source, target } = flowOf(edge);
         const from = placed.get(source);

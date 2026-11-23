@@ -9,12 +9,14 @@
  * once, and its result or throw passes through unchanged. A returned failure is recorded as `failure.code` with
  * `journal.outcome = failure`, never as an exception event; a throw is `journal.outcome = defect`. Inputs, payloads,
  * meta, results and error messages are never attributes. With no SDK installed, every call is a no-op.
+ * The worker runs its loops through `inRootContext`, so each job starts its own trace instead of joining the caller
+ * that started the worker. Journal rows carry no OpenTelemetry trace context, so there is no producer trace to continue.
  * Leaf file.
  */
 import type { Attributes, Span } from '@opentelemetry/api';
-import { context, SpanStatusCode, trace } from '@opentelemetry/api';
+import { context, ROOT_CONTEXT, SpanStatusCode, trace } from '@opentelemetry/api';
 
-import { isFailure } from '@arki/failure';
+import { isFailure, isFault } from '@arki/failure';
 
 /** The span names the journal emits. */
 export const JOURNAL_SPANS = ['journal.command', 'journal.effect', 'journal.step'] as const;
@@ -31,6 +33,32 @@ function observe<T>(operation: () => T): T | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** What one run of `work` gave: its value, or what it threw. */
+type Ran<T> = { readonly value: T } | { readonly error: unknown };
+
+/**
+ * Runs `work` in the root context, so the spans it opens start their own trace. In a Dot app the worker starts
+ * inside the `dot.unit.start` span, which ends at once: a background job must not look like part of app startup.
+ * A context manager that throws is ignored, and `work` runs exactly once.
+ */
+export function inRootContext<T>(work: () => T): T {
+  let ran: Ran<T> | undefined;
+  const once = (): Ran<T> => {
+    if (ran === undefined) {
+      try {
+        ran = { value: work() };
+      } catch (error) {
+        ran = { error };
+      }
+    }
+    return ran;
+  };
+  void observe(() => context.with(ROOT_CONTEXT, once));
+  const outcome = once();
+  if ('error' in outcome) throw outcome.error;
+  return outcome.value;
 }
 
 /** Runs `work` inside span `name`, as the active span, so commands it runs become child spans. */
@@ -50,7 +78,8 @@ export async function withJournalSpan<T>(
     if (isFailure<unknown>(result)) {
       outcome('failure');
       observe(() => span?.setAttribute('failure.code', result.code));
-      observe(() => span?.setStatus({ code: SpanStatusCode.ERROR, message: result.code }));
+      // An expected outcome (4xx) leaves the status unset; only a fault (5xx) is an error.
+      if (isFault(result)) observe(() => span?.setStatus({ code: SpanStatusCode.ERROR, message: result.code }));
     } else {
       outcome('ok');
     }

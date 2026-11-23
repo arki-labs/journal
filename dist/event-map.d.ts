@@ -20,6 +20,19 @@ type ManifestLike = Parameters<typeof projectGraph>[0];
  * entrypoint root, which is resolved against `cwd` (the folder `dot` runs in, by default).
  */
 export declare function project(manifest: ManifestLike, cwd?: string): Promise<EventMapDocument>;
+/**
+ * `checkEventMapFile` could not read the Mermaid file (for a reason other than "no such file") or could not write it.
+ * `detail` names the file and the file-system error.
+ * @fix Make the file readable, and its folder writable when `update` is true, then run the check again.
+ * @verify bun run test -- src/event-map.test.ts
+ */
+export declare const EventMapFileFailed: import("@arki/failure").FailureDefinition<"journal.event_map_file_failed", import("@standard-schema/spec").StandardSchemaV1<{
+    detail: string;
+}, {
+    detail: string;
+}>>;
+/** An {@link EventMapFileFailed} failure value. */
+export type EventMapFileFailed = ReturnType<typeof EventMapFileFailed>;
 /** The result of `checkEventMapFile`. A `stale` or `missing` file carries a line diff for the test report. */
 export type EventMapFileCheck = {
     readonly state: 'fresh';
@@ -39,5 +52,5 @@ export declare function checkEventMapFile(options: {
     readonly file: string;
     readonly mermaid: string;
     readonly update?: boolean;
-}): Promise<EventMapFileCheck>;
+}): Promise<EventMapFileCheck | EventMapFileFailed>;
 //# sourceMappingURL=event-map.d.ts.map

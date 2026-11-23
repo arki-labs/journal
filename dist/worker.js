@@ -21,7 +21,7 @@ import { attemptId, leaseToken } from './id.js';
 import { journalOwnedEffect, unwatchedRun } from './internal-context.js';
 import { effectOverrides, keepFor, keepUntil, resolveRetention } from './retention.js';
 import { assertRootDb } from './storage.js';
-import { withJournalSpan } from './telemetry.js';
+import { inRootContext, withJournalSpan } from './telemetry.js';
 const DEFAULT_LEASE_SECONDS = 60;
 /**
  * The retry of an effect or a workflow step that sets none: 7 retries (8 tries), doubling from 1 s to at most
@@ -58,7 +58,7 @@ const FORWARD_BEHIND_DELAY_MS = 5000;
 const streamHead = (jobsTable) => or(isNull(jobsTable.stream), sql `not exists (select 1 from ${jobsTable} as earlier where earlier.stream = ${jobsTable.stream} and earlier.stream_position < ${jobsTable.streamPosition})`);
 export function createDrain(deps) {
     const { jobs: jobsTable, jobAttempts: attemptsTable, jobArchive: archiveTable } = deps.tables;
-    const policy = deps.retention ?? resolveRetention(undefined);
+    const policy = deps.retention ?? resolveRetention();
     const effectOverride = effectOverrides(deps.effects);
     const { decodeStoredEvent } = deps.history;
     const known = deps.effects.map(effect => effect.name);
@@ -694,20 +694,47 @@ export function createWorkers(deps) {
                 stopping = new AbortController();
                 wakers.add(wake);
                 if (opts?.listen !== undefined) {
-                    unlisten = await opts.listen(payload => {
-                        wake();
-                        if (opts.taps === false)
-                            return;
-                        dispatching = dispatching.then(() => deps.dispatch(db, payload, opts.services)).catch(quiet);
-                    });
+                    // A listener that fails (returned or thrown) undoes the start, so a later `start()` tries again.
+                    const undo = () => {
+                        running = false;
+                        wakers.delete(wake);
+                        stopping = new AbortController();
+                    };
+                    let listened;
+                    try {
+                        listened = await opts.listen(payload => {
+                            wake();
+                            if (opts.taps === false)
+                                return;
+                            // A wake can arrive in the context that opened the listener: the taps start their own trace.
+                            dispatching = dispatching
+                                .then(() => inRootContext(() => deps.dispatch(db, payload, opts.services)))
+                                .catch(quiet);
+                        });
+                    }
+                    catch (error) {
+                        undo();
+                        throw error;
+                    }
+                    // `Unlisten` is a function and a failure never is: that splits the two, where `isFailure`
+                    // cannot narrow the inferred `ListenFailure`.
+                    if (typeof listened !== 'function') {
+                        undo();
+                        debugWorker.debug('start refused: the listener failed: {failed}', { failed: errorText(listened) });
+                        return listened;
+                    }
+                    unlisten = listened;
                 }
                 debugWorker.debug('start (poll {pollMs}ms{value2})', {
                     pollMs,
                     value2: unlisten === undefined ? '' : ', listening',
                 });
-                loop = run();
-                if (deps.sweep !== undefined)
-                    sweeping = sweepLoop(deps.sweep);
+                // Each job starts its own trace, never under the span that called `start()` (in Dot, `dot.unit.start`).
+                loop = inRootContext(run);
+                const sweep = deps.sweep;
+                if (sweep !== undefined)
+                    sweeping = inRootContext(() => sweepLoop(sweep));
+                return;
             },
             async stop() {
                 running = false;

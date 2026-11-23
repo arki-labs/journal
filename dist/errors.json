@@ -132,61 +132,7 @@
     "what": "A feature supplied an invalid Journal contribution.",
     "fix": "Declare a feature's reactions with journalHandlers(core, { effects, taps, workflows }) in .usecases(...), and its projections with journalProjections(...) in .infra(...), both from",
     "verify": "bun run test -- src/dot-feature.test.ts",
-    "source": "src/dot.ts:95"
-  },
-  {
-    "code": "ARKI_JOURNAL_WEBHOOK_E001",
-    "package": "@arki/journal",
-    "kind": "thrown",
-    "what": "An input failed its schema, a payload is not JSON, or a URL is not public https.",
-    "fix": "Validate the webhook input and JSON payload; use a public HTTPS destination.",
-    "verify": "bun run test -- src/http/webhooks.test.ts",
-    "source": "src/http/webhooks.ts:55"
-  },
-  {
-    "code": "ARKI_JOURNAL_WEBHOOK_E002",
-    "package": "@arki/journal",
-    "kind": "thrown",
-    "what": "`dispatch` got the root database. It needs the business transaction.",
-    "fix": "Dispatch inside the business database transaction and pass its transaction handle.",
-    "verify": "bun run test -- src/http/webhooks.test.ts",
-    "source": "src/http/webhooks.ts:60"
-  },
-  {
-    "code": "ARKI_JOURNAL_WEBHOOK_E003",
-    "package": "@arki/journal",
-    "kind": "thrown",
-    "what": "No subscription or message has this id.",
-    "fix": "Check the subscription or message id and use an existing record.",
-    "verify": "bun run test -- src/http/webhooks.test.ts",
-    "source": "src/http/webhooks.ts:65"
-  },
-  {
-    "code": "ARKI_JOURNAL_WEBHOOK_E004",
-    "package": "@arki/journal",
-    "kind": "thrown",
-    "what": "`replay` named a message and a subscription of different partners.",
-    "fix": "Replay only to a subscription owned by the same partner as the message.",
-    "verify": "bun run test -- src/http/webhooks.test.ts",
-    "source": "src/http/webhooks.ts:70"
-  },
-  {
-    "code": "ARKI_JOURNAL_WEBHOOK_E005",
-    "package": "@arki/journal",
-    "kind": "thrown",
-    "what": "`encryptionKey` is not 32 bytes of base64.",
-    "fix": "Configure encryptionKey as a base64-encoded 32-byte key.",
-    "verify": "bun run test -- src/http/webhooks.test.ts",
-    "source": "src/http/webhooks.ts:75"
-  },
-  {
-    "code": "ARKI_JOURNAL_WEBHOOK_E006",
-    "package": "@arki/journal",
-    "kind": "thrown",
-    "what": "The subscriber answered with a status other than 2xx. The worker retries it.",
-    "fix": "Inspect the subscriber response and restore its successful 2xx handling; let the worker retry delivery.",
-    "verify": "bun run test -- src/http/webhooks.test.ts",
-    "source": "src/http/webhooks.ts:80"
+    "source": "src/dot.ts:97"
   },
   {
     "code": "journal.conflict",
@@ -196,6 +142,15 @@
     "fix": "Refresh the resource state and choose an operation permitted by its current state.",
     "verify": "bun run test -- src/returned-failure.test.ts",
     "source": "src/errors.ts:280"
+  },
+  {
+    "code": "journal.event_map_file_failed",
+    "package": "@arki/journal",
+    "kind": "failure",
+    "what": "`checkEventMapFile` could not read the Mermaid file (for a reason other than \"no such file\") or could not write it. `detail` names the file and the file-system error.",
+    "fix": "Make the file readable, and its folder writable when `update` is true, then run the check again.",
+    "verify": "bun run test -- src/event-map.test.ts",
+    "source": "src/event-map.ts:234"
   },
   {
     "code": "journal.forbidden",
@@ -223,6 +178,51 @@
     "fix": "Check the resource identifier and use an existing resource visible to this command.",
     "verify": "bun run test -- src/returned-failure.test.ts",
     "source": "src/errors.ts:241"
+  },
+  {
+    "code": "journal.webhook_configuration_invalid",
+    "package": "@arki/journal",
+    "kind": "failure",
+    "what": "A `webhookSender` setting cannot work, such as an `encryptionKey` that is not 32 bytes of base64. Thrown (as `UnexpectedFailure`) when the sender is built at boot, never returned later.",
+    "fix": "Configure encryptionKey as a base64-encoded 32-byte key.",
+    "verify": "bun run test -- src/http/webhooks.test.ts",
+    "source": "src/http/webhooks.ts:107"
+  },
+  {
+    "code": "journal.webhook_delivery_failed",
+    "package": "@arki/journal",
+    "kind": "failure",
+    "what": "The subscriber answered with a status other than 2xx. The runner throws it as `UnexpectedFailure`, so the worker retries it under `retry`; it never reaches a caller.",
+    "fix": "Inspect the subscriber response and restore its 2xx handling; the worker retries the delivery.",
+    "verify": "bun run test -- src/http/webhooks.test.ts",
+    "source": "src/http/webhooks.ts:94"
+  },
+  {
+    "code": "journal.webhook_not_found",
+    "package": "@arki/journal",
+    "kind": "failure",
+    "what": "`replay`, `rotateSecret`, `enable` or `disable` named a message or subscription that does not exist.",
+    "fix": "Check the subscription or message id and use an existing record.",
+    "verify": "bun run test -- src/http/webhooks.test.ts",
+    "source": "src/http/webhooks.ts:56"
+  },
+  {
+    "code": "journal.webhook_other_partner",
+    "package": "@arki/journal",
+    "kind": "failure",
+    "what": "`replay` named a message and a subscription of different partners: sending it would leak one partner's data to another.",
+    "fix": "Replay only to a subscription owned by the same partner as the message.",
+    "verify": "bun run test -- src/http/webhooks.test.ts",
+    "source": "src/http/webhooks.ts:69"
+  },
+  {
+    "code": "journal.webhook_payload_too_large",
+    "package": "@arki/journal",
+    "kind": "failure",
+    "what": "The body `dispatch` would store is over `maxPayloadBytes`. It is sent to every subscriber on every try.",
+    "fix": "Send a smaller payload, such as ids the subscriber fetches, or raise maxPayloadBytes.",
+    "verify": "bun run test -- src/http/webhooks.test.ts",
+    "source": "src/http/webhooks.ts:81"
   },
   {
     "code": "journal.workflow_busy",

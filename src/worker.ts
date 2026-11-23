@@ -8,6 +8,7 @@
 import { and, asc, desc, eq, inArray, isNull, lte, notInArray, or, sql } from 'drizzle-orm';
 
 import type { IdGenerationFailure } from '@arki/contracts';
+import type { Failure } from '@arki/failure';
 import type { SchemaOutput, StandardSchemaV1 } from '@arki/schema';
 import { Cancelled } from '@arki/async';
 import { attempt, isFailure, orThrow } from '@arki/failure';
@@ -50,7 +51,7 @@ import type { InternalEffectContext } from './internal-context.js';
 import { journalOwnedEffect, unwatchedRun } from './internal-context.js';
 import { effectOverrides, keepFor, keepUntil, resolveRetention } from './retention.js';
 import { assertRootDb } from './storage.js';
-import { withJournalSpan } from './telemetry.js';
+import { inRootContext, withJournalSpan } from './telemetry.js';
 
 const DEFAULT_LEASE_SECONDS = 60;
 /**
@@ -139,7 +140,7 @@ export function createDrain<Meta extends StandardSchemaV1<unknown, Record<string
   deps: DrainDeps<Meta, AppDb, Run>,
 ) {
   const { jobs: jobsTable, jobAttempts: attemptsTable, jobArchive: archiveTable } = deps.tables;
-  const policy = deps.retention ?? resolveRetention(undefined);
+  const policy = deps.retention ?? resolveRetention();
   const effectOverride = effectOverrides(deps.effects);
   const { decodeStoredEvent } = deps.history;
   const known = deps.effects.map(effect => effect.name);
@@ -828,18 +829,18 @@ export function createWorkers<AppDb extends RootDb>(deps: WorkerDeps<AppDb>) {
   /** One wake function per running worker this journal started. */
   const wakers = new Set<() => void>();
 
-  const worker = (
+  const worker = <ListenFailure extends Failure = never>(
     db: AppDb & RootDb,
     opts?: {
       readonly pollMs?: number;
       readonly batchSize?: number;
       readonly leaseSeconds?: number;
-      readonly listen?: WakeListener;
+      readonly listen?: WakeListener<ListenFailure>;
       readonly taps?: boolean;
       readonly services?: HandlerServices;
       readonly jobs?: JobRunner<AppDb>;
     },
-  ): JournalWorker => {
+  ): JournalWorker<ListenFailure> => {
     assertRootDb(db, 'worker');
     deps.checkServices(opts?.services);
     if (deps.tapNames.length > 0 && opts?.listen === undefined && opts?.taps !== false)
@@ -940,18 +941,44 @@ export function createWorkers<AppDb extends RootDb>(deps: WorkerDeps<AppDb>) {
         stopping = new AbortController();
         wakers.add(wake);
         if (opts?.listen !== undefined) {
-          unlisten = await opts.listen(payload => {
-            wake();
-            if (opts.taps === false) return;
-            dispatching = dispatching.then(() => deps.dispatch(db, payload, opts.services)).catch(quiet);
-          });
+          // A listener that fails (returned or thrown) undoes the start, so a later `start()` tries again.
+          const undo = (): void => {
+            running = false;
+            wakers.delete(wake);
+            stopping = new AbortController();
+          };
+          let listened: Unlisten | ListenFailure;
+          try {
+            listened = await opts.listen(payload => {
+              wake();
+              if (opts.taps === false) return;
+              // A wake can arrive in the context that opened the listener: the taps start their own trace.
+              dispatching = dispatching
+                .then(() => inRootContext(() => deps.dispatch(db, payload, opts.services)))
+                .catch(quiet);
+            });
+          } catch (error) {
+            undo();
+            throw error;
+          }
+          // `Unlisten` is a function and a failure never is: that splits the two, where `isFailure`
+          // cannot narrow the inferred `ListenFailure`.
+          if (typeof listened !== 'function') {
+            undo();
+            debugWorker.debug('start refused: the listener failed: {failed}', { failed: errorText(listened) });
+            return listened;
+          }
+          unlisten = listened;
         }
         debugWorker.debug('start (poll {pollMs}ms{value2})', {
           pollMs,
           value2: unlisten === undefined ? '' : ', listening',
         });
-        loop = run();
-        if (deps.sweep !== undefined) sweeping = sweepLoop(deps.sweep);
+        // Each job starts its own trace, never under the span that called `start()` (in Dot, `dot.unit.start`).
+        loop = inRootContext(run);
+        const sweep = deps.sweep;
+        if (sweep !== undefined) sweeping = inRootContext(() => sweepLoop(sweep));
+        return;
       },
       async stop() {
         running = false;

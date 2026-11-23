@@ -30,43 +30,69 @@ import type { IdGenerationFailure } from '@arki/contracts';
 import type { Backoff } from '@arki/resilience';
 import type { JournalTables } from '../pg.js';
 import type { DbHandle, RootDb, ScheduledJob } from '../types.js';
-/** Stable codes for {@link WebhookError}. Match on codes, never parse messages. */
-export declare const WEBHOOK_ERROR_CODES: {
-    /** An input failed its schema, a payload is not JSON, or a URL is not public https.
-     * @fix Validate the webhook input and JSON payload; use a public HTTPS destination.
-     * @verify bun run test -- src/http/webhooks.test.ts
-     */
-    readonly badInput: 'ARKI_JOURNAL_WEBHOOK_E001';
-    /** `dispatch` got the root database. It needs the business transaction.
-     * @fix Dispatch inside the business database transaction and pass its transaction handle.
-     * @verify bun run test -- src/http/webhooks.test.ts
-     */
-    readonly notInTransaction: 'ARKI_JOURNAL_WEBHOOK_E002';
-    /** No subscription or message has this id.
-     * @fix Check the subscription or message id and use an existing record.
-     * @verify bun run test -- src/http/webhooks.test.ts
-     */
-    readonly notFound: 'ARKI_JOURNAL_WEBHOOK_E003';
-    /** `replay` named a message and a subscription of different partners.
-     * @fix Replay only to a subscription owned by the same partner as the message.
-     * @verify bun run test -- src/http/webhooks.test.ts
-     */
-    readonly otherPartner: 'ARKI_JOURNAL_WEBHOOK_E004';
-    /** `encryptionKey` is not 32 bytes of base64.
-     * @fix Configure encryptionKey as a base64-encoded 32-byte key.
-     * @verify bun run test -- src/http/webhooks.test.ts
-     */
-    readonly badEncryptionKey: 'ARKI_JOURNAL_WEBHOOK_E005';
-    /** The subscriber answered with a status other than 2xx. The worker retries it.
-     * @fix Inspect the subscriber response and restore its successful 2xx handling; let the worker retry delivery.
-     * @verify bun run test -- src/http/webhooks.test.ts
-     */
-    readonly deliveryFailed: 'ARKI_JOURNAL_WEBHOOK_E006';
-};
-export declare class WebhookError extends Error {
-    readonly code: string;
-    constructor(code: string, message: string, options?: ErrorOptions);
-}
+/**
+ * `replay`, `rotateSecret`, `enable` or `disable` named a message or subscription that does not exist.
+ * @fix Check the subscription or message id and use an existing record.
+ * @verify bun run test -- src/http/webhooks.test.ts
+ */
+export declare const WebhookNotFound: import("@arki/failure").FailureDefinition<"journal.webhook_not_found", import("@standard-schema/spec").StandardSchemaV1<{
+    kind: "message" | "subscription";
+    id: string;
+}, {
+    kind: "message" | "subscription";
+    id: string;
+}>>;
+/**
+ * `replay` named a message and a subscription of different partners: sending it would leak one
+ * partner's data to another.
+ * @fix Replay only to a subscription owned by the same partner as the message.
+ * @verify bun run test -- src/http/webhooks.test.ts
+ */
+export declare const WebhookOtherPartner: import("@arki/failure").FailureDefinition<"journal.webhook_other_partner", import("@standard-schema/spec").StandardSchemaV1<{
+    messageId: string;
+    subscriptionId: string;
+}, {
+    messageId: string;
+    subscriptionId: string;
+}>>;
+/**
+ * The body `dispatch` would store is over `maxPayloadBytes`. It is sent to every subscriber on every try.
+ * @fix Send a smaller payload, such as ids the subscriber fetches, or raise maxPayloadBytes.
+ * @verify bun run test -- src/http/webhooks.test.ts
+ */
+export declare const WebhookPayloadTooLarge: import("@arki/failure").FailureDefinition<"journal.webhook_payload_too_large", import("@standard-schema/spec").StandardSchemaV1<{
+    size: number;
+    limit: number;
+}, {
+    size: number;
+    limit: number;
+}>>;
+/**
+ * The subscriber answered with a status other than 2xx. The runner throws it as `UnexpectedFailure`, so the
+ * worker retries it under `retry`; it never reaches a caller.
+ * @fix Inspect the subscriber response and restore its 2xx handling; the worker retries the delivery.
+ * @verify bun run test -- src/http/webhooks.test.ts
+ */
+export declare const WebhookDeliveryFailed: import("@arki/failure").FailureDefinition<"journal.webhook_delivery_failed", import("@standard-schema/spec").StandardSchemaV1<{
+    subscriptionId: string;
+    responseStatus: number;
+}, {
+    subscriptionId: string;
+    responseStatus: number;
+}>>;
+/**
+ * A `webhookSender` setting cannot work, such as an `encryptionKey` that is not 32 bytes of base64.
+ * Thrown (as `UnexpectedFailure`) when the sender is built at boot, never returned later.
+ * @fix Configure encryptionKey as a base64-encoded 32-byte key.
+ * @verify bun run test -- src/http/webhooks.test.ts
+ */
+export declare const WebhookConfigurationInvalid: import("@arki/failure").FailureDefinition<"journal.webhook_configuration_invalid", import("@standard-schema/spec").StandardSchemaV1<{
+    setting: string;
+    problem: string;
+}, {
+    setting: string;
+    problem: string;
+}>>;
 /**
  * The webhook tables. Call this once in the app's schema module, next to `journalTables()`,
  * so `drizzle-kit generate` creates them. The library never creates tables at runtime.
@@ -505,13 +531,13 @@ export type WebhookSenderOptions = {
     /** The largest body `dispatch` accepts, in bytes. It is sent to every subscriber on every try. Default 1 MiB. */
     readonly maxPayloadBytes?: number;
 };
-/** A new endpoint: whose events it gets, where, and which ones. */
+/** A new endpoint: whose events it gets, where (public https), and which ones. `webhook-schemas.ts` checks it. */
 export type SubscribeInput = {
     readonly partner: string;
     readonly url: string;
     readonly events: readonly string[];
 };
-/** One event for a partner's subscribers. `payload` must be JSON. */
+/** One event for a partner's subscribers. `payload` must be JSON. `webhook-schemas.ts` checks it. */
 export type DispatchInput = {
     readonly partner: string;
     readonly event: string;
@@ -530,44 +556,70 @@ export declare function webhookSender(options: WebhookSenderOptions): {
     };
     /**
      * Adds an endpoint for a partner's events and returns its signing secret, the only time it
-     * is readable: show it to the partner once. The URL must be public https.
+     * is readable: show it to the partner once. The URL must be public https: anything else, and
+     * input that fails its schema, returns `InvalidInput` with the issues.
      */
-    subscribe: (db: DbHandle, input: SubscribeInput) => Promise<{
-        id: string;
+    subscribe: (db: DbHandle, input: SubscribeInput) => Promise<import("@arki/failure").Failure<"contracts.random_source_unavailable", undefined> | import("@arki/failure").Failure<"failure.unexpected_defect", undefined> | import("@arki/failure").Failure<"schema.async_required", undefined> | import("@arki/failure").Failure<"schema.invalid_input", {
+        issues: readonly import("@standard-schema/spec").StandardSchemaV1.Issue[];
+    }> | import("@arki/failure").Failure<"schema.validator_defect", undefined> | {
+        id: `whs_${string}`;
         secret: string;
-    } | IdGenerationFailure>;
+    }>;
     /**
      * Writes the message and one delivery per active subscription of this partner and event, in
      * `tx`. A rollback removes them with the business write. The payload is stored once, as the
-     * body `{ type, timestamp, data }` every delivery sends.
+     * body `{ type, timestamp, data }` every delivery sends. Input that fails its schema or a payload
+     * that is not JSON returns `InvalidInput`; a body over `maxPayloadBytes` returns `WebhookPayloadTooLarge`.
      */
-    dispatch: (tx: WebhookTx, input: DispatchInput) => Promise<{
+    dispatch: (tx: WebhookTx, input: DispatchInput) => Promise<import("@arki/failure").Failure<"journal.webhook_payload_too_large", {
+        size: number;
+        limit: number;
+    }> | import("@arki/failure").Failure<"schema.async_required", undefined> | import("@arki/failure").Failure<"schema.invalid_input", {
+        issues: readonly import("@standard-schema/spec").StandardSchemaV1.Issue[];
+    }> | import("@arki/failure").Failure<"schema.validator_defect", undefined> | {
         messageId: string;
         deliveries: number;
     } | IdGenerationFailure>;
     /**
      * Sends a stored message again to one subscription of the same partner, with the same
      * `webhook-id`. A disabled subscription records the try as skipped: `enable` it first.
+     * An unknown id returns `WebhookNotFound`; a subscription of another partner, `WebhookOtherPartner`.
      */
     replay: (db: DbHandle, input: {
         messageId: string;
         subscriptionId: string;
-    }) => Promise<{
+    }) => Promise<import("@arki/failure").Failure<"contracts.random_source_unavailable", undefined> | import("@arki/failure").Failure<"failure.unexpected_defect", undefined> | import("@arki/failure").Failure<"journal.webhook_not_found", {
+        kind: "message" | "subscription";
+        id: string;
+    }> | import("@arki/failure").Failure<"journal.webhook_other_partner", {
+        messageId: string;
+        subscriptionId: string;
+    }> | {
         jobId: string;
-    } | IdGenerationFailure>;
+    }>;
     /**
      * A new signing secret. The old one keeps signing too for `windowSeconds` (default a day),
-     * so the partner can switch without dropping a message. Returns the new secret once.
+     * so the partner can switch without dropping a message. Returns the new secret once, or
+     * `WebhookNotFound` for an unknown id.
      */
     rotateSecret: (db: DbHandle, subscriptionId: string, rotation?: {
         readonly windowSeconds?: number;
-    }) => Promise<{
+    }) => Promise<import("@arki/failure").Failure<"journal.webhook_not_found", {
+        kind: "message" | "subscription";
+        id: string;
+    }> | {
         secret: string;
     }>;
-    /** Turns a subscription back on and clears its dead-letter count. */
-    enable: (db: DbHandle, subscriptionId: string) => Promise<void>;
-    /** Stops deliveries: new messages skip it, queued ones record `skipped`. */
-    disable: (db: DbHandle, subscriptionId: string) => Promise<void>;
+    /** Turns a subscription back on and clears its dead-letter count. `WebhookNotFound` for an unknown id. */
+    enable: (db: DbHandle, subscriptionId: string) => Promise<import("@arki/failure").Failure<"journal.webhook_not_found", {
+        kind: "message" | "subscription";
+        id: string;
+    }> | undefined>;
+    /** Stops deliveries: new messages skip it, queued ones record `skipped`. `WebhookNotFound` for an unknown id. */
+    disable: (db: DbHandle, subscriptionId: string) => Promise<import("@arki/failure").Failure<"journal.webhook_not_found", {
+        kind: "message" | "subscription";
+        id: string;
+    }> | undefined>;
 };
 export type WebhookSender = ReturnType<typeof webhookSender>;
 //# sourceMappingURL=webhooks.d.ts.map

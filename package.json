@@ -1,6 +1,6 @@
 {
   "name": "@arki/journal",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "A journal for Drizzle entities: every change is an immutable event row, the current state is a normal table row, and both are written in one transaction. Inline projections run in the same transaction; effects run after commit from a job table.",
   "license": "MIT",
   "repository": {
@@ -122,21 +122,21 @@
     "package.json"
   ],
   "dependencies": {
-    "@arki/async": "0.3.0",
-    "@arki/contracts": "0.4.1",
-    "@arki/db": "0.5.1",
-    "@arki/failure": "0.3.0",
-    "@arki/log": "0.4.0",
-    "@arki/resilience": "0.3.2",
-    "@arki/schema": "0.3.0",
+    "@arki/async": "0.3.1",
+    "@arki/contracts": "0.4.2",
+    "@arki/db": "0.6.0",
+    "@arki/failure": "0.4.0",
+    "@arki/log": "0.4.1",
+    "@arki/resilience": "0.3.3",
+    "@arki/schema": "0.3.1",
     "@opentelemetry/api": "^1.9.1",
     "drizzle-orm": "1.0.0-rc.4",
     "zod": "4.6.5"
   },
   "peerDependencies": {
-    "@arki/admin": "^0.3.0",
-    "@arki/dot": "^0.10.0",
-    "@arki/http": "^0.4.1",
+    "@arki/admin": "^0.3.1",
+    "@arki/dot": "^0.11.0",
+    "@arki/http": "^0.5.0",
     "@electric-sql/pglite": "^0.4.6",
     "@kurrent/kurrentdb-client": "^1.3.1",
     "@orpc/server": "^1.15.5",

@@ -340,7 +340,7 @@ export type Journal<Meta extends StandardSchemaV1<unknown, Record<string, unknow
      * A loop around `drain`. The same database as `drain`. `stop()` aborts the running
      * effect's `ctx.signal`, claims nothing more, and resolves when that effect returns.
      */
-    worker(db: AppDb & RootDb & TransactionSource<Tx>, opts?: {
+    worker<ListenFailure extends Failure = never>(db: AppDb & RootDb & TransactionSource<Tx>, opts?: {
         readonly pollMs?: number;
         readonly batchSize?: number;
         readonly leaseSeconds?: number;
@@ -349,7 +349,7 @@ export type Journal<Meta extends StandardSchemaV1<unknown, Record<string, unknow
          * worker at once, from any process, and the journal's taps fire here for those events.
          * Required when the journal has taps, unless `taps: false` says this worker runs jobs only.
          */
-        readonly listen?: WakeListener;
+        readonly listen?: WakeListener<ListenFailure>;
         /** `false`: a jobs-only worker in a journal that has taps. Another process must listen. */
         readonly taps?: boolean;
         /**
@@ -364,7 +364,7 @@ export type Journal<Meta extends StandardSchemaV1<unknown, Record<string, unknow
          * claims effect rows only, exactly as before.
          */
         readonly jobs?: JobRunner<AppDb>;
-    }): JournalWorker;
+    }): JournalWorker<ListenFailure>;
     /**
      * The Postgres channel every commit that recorded events notifies, with the seq range as
      * JSON `{ "from": n, "to": m }`. `journal_wake`, or `<schema>_journal_wake` for tables in a

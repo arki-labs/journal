@@ -208,11 +208,6 @@ export declare const signalEnvelope: z.ZodReadonly<z.ZodObject<{
     payload: z.ZodUnknown;
 }, z.core.$strip>>;
 type Definitions<Meta extends StandardSchemaV1<unknown, Record<string, unknown>>, Tx extends TransactionSource<Tx>, AppDb extends RootDb> = Pick<JournalDefinitions<Meta, Tx, AppDb>, 'event' | 'entity' | 'projection' | 'command'>;
-/**
- * The workflow runner of one `initJournal()`: `workflow` builds definitions with `start`; `register`, called by
- * `compose`, returns the step effect and the step projection. The `workflow.run` entity is built here from the
- * journal tables `initJournal` was given, like any entity of the app.
- */
 export declare function createWorkflows<Meta extends StandardSchemaV1<unknown, Record<string, unknown>>, Tx extends TransactionSource<Tx>, AppDb extends RootDb>(j: Definitions<Meta, Tx, AppDb>, tables: JournalTables, retention: JobRetention | undefined, decodeEvent: ReturnType<typeof createEventDecoder<Meta>>): {
     workflow: <Input extends StandardSchemaV1, N extends Needs = Readonly<Record<never, import("../types.js").Need<unknown>>>, Declared extends StandardSchemaV1 | undefined = undefined, E extends AnyEntity<SchemaOutput<Meta>> = never, D extends import("../types.js").EventsOf<E> = never, Timing extends import("./define.js").StartTiming = "after-commit">(name: string, options: import("./define.js").WorkflowOptions<Input, N, Declared, import("./define.js").StartOn<Input, E, D, SchemaOutput<Meta>, Timing>, {
         readonly db: AppDb;
